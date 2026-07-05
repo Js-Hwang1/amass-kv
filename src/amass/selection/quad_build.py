@@ -1,0 +1,105 @@
+"""quad build / refresh — the query-INDEPENDENT quad page summary.
+
+Mirror of :func:`r8_build_refresh` (same page-gram eigh, same content-tag
+invalidation, same off-hot-path lifecycle) with exactly ONE change: it stores
+the r' EIGENVALUES ``sig2`` of the centered-key scatter instead of the r8
+per-key coordinate block ``c``.  That is the whole r8->quad saving (P*r coords
+-> r values).  Per (block, kv-head), for a finalized page:
+
+    mu   = mean_t K            (d,)                 page centroid
+    dc   = K - mu              (page, d)            centered keys
+    Gm   = dc @ dcᵀ            (page, page)         page-gram (cheap 16x16 eigh)
+    S², U = eigh(Gm)                                ascending eigenpairs
+    S8   = sqrt(clamp(S²[-r':]))                    (r',)  top-r' singular values
+    U8   = U[..., -r':]        (page, r')
+    Vk   = dcᵀ @ U8 / S8       (d, r')              right singular axes (== r8 V)
+    sig2 = S²[-r':]            (r',)                the eigenvalues sigma_k^2
+
+``sig2[k] = sigma_k^2 = (c_k^2).sum_t`` because ``c = U8 * S8`` and U8's columns
+are orthonormal over the page dim, so ``sum_t c_k^2 = S8_k^2 = S²_k``.  We store
+S²[-r':] directly and NEVER materialise or quantise ``c``.
+
+int8 fake-quant reuses the r8 helpers (mu per-vector int8, V per-column int8/
+int4) unchanged; sig2 stays fp16 (r' small, DC-magnitude sensitive).  NOT
+graph-safe by design (eigh + boolean gather); called on page-finalize.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+
+from .build import _eigh_jacobi, _quant_mu, _quant_vk
+from .quad_state import QuadState
+
+
+# --------------------------------------------------------------------------- #
+def quad_build_refresh(st: QuadState, layer: int, K: torch.Tensor,
+                       block_table: torch.Tensor, seq_lens: torch.Tensor,
+                       n_req: int, *, force: bool = False) -> int:
+    """(Re)build the quad summary for every STALE finalized page of the batch.
+
+    K            per-layer key view (NB, page, n_kv, d), the engine K half.
+    block_table  (n_req, max_blocks) int32, logical page -> physical block.
+    seq_lens     (n_req,) int32.
+    force        ignore tags and rebuild all finalized pages (tests).
+
+    Returns the number of physical blocks rebuilt (0 in the steady state).
+    Same tag-gated, off-hot-path contract as ``r8_build_refresh``.
+    """
+    device = K.device
+    page, n_kv, d, r, tagw = st.page, st.n_kv, st.d, st.r, st.tagw
+    if n_req == 0:
+        return 0
+    sl = seq_lens[:n_req].to(torch.int64)
+    n_fin = sl // page                                    # finalized pages/req
+    max_fin = int(n_fin.max().item())
+    if max_fin == 0:
+        return 0
+
+    pidx = torch.arange(max_fin, device=device)
+    fin_mask = pidx[None, :] < n_fin[:, None]             # (n_req, max_fin)
+    bt = block_table[:n_req, :max_fin].to(torch.int64)    # (n_req, max_fin)
+    blocks_flat = bt[fin_mask]                            # (n_valid,)
+    if blocks_flat.numel() == 0:
+        return 0
+
+    if force:
+        stale = torch.ones(blocks_flat.numel(), dtype=torch.bool, device=device)
+    else:
+        # content tag = leading TAGW channels of the page-final token's key.
+        tag_cur = K[blocks_flat, page - 1, :, :tagw].float()   # (n_valid,n_kv,W)
+        tag_old = st.quad_tag[layer, blocks_flat].float()
+        stale = (tag_cur != tag_old).any(dim=(1, 2))           # NaN-init -> True
+
+    sb = torch.unique(blocks_flat[stale])                 # physical blocks
+    if sb.numel() == 0:
+        return 0
+
+    # ---- eigh page-gram summary (fp32), per (block, kv-head) ------------- #
+    Kp = K[sb].permute(0, 2, 1, 3).float()                # (n_stale,n_kv,page,d)
+    mu = Kp.mean(dim=2)                                    # (n_stale,n_kv,d)
+    dc = Kp - mu[:, :, None, :]                            # (n_stale,n_kv,page,d)
+    Gm = torch.matmul(dc, dc.transpose(-1, -2))           # (..,page,page)
+    # Custom 16x16 Jacobi (Piece C); AMASS_EIGH=torch forces cusolver.
+    if page == 16 and os.environ.get("AMASS_EIGH", "jacobi") != "torch":
+        S2, U = _eigh_jacobi(Gm)                          # ascending
+    else:
+        S2, U = torch.linalg.eigh(Gm)                     # ascending
+    S2r = S2[..., -r:].clamp_min(1e-10)                   # (..,r') eigenvalues
+    S8 = S2r.sqrt()                                        # (..,r')
+    U8 = U[..., -r:]                                       # (..,page,r')
+    Vk = torch.matmul(dc.transpose(-1, -2), U8) / S8[..., None, :]  # (..,d,r')
+
+    # ---- int8/int4 fake-quant (reuse the r8 helpers) -------------------- #
+    mu_code, mu_s = _quant_mu(mu)
+    Vk_code, Vk_s = _quant_vk(Vk, st.v_grain, st.v_bits)
+
+    # ---- scatter into the layer slab + refresh tags -------------------- #
+    st.quad_mu[layer, sb] = mu_code
+    st.mu_scale[layer, sb] = mu_s
+    st.quad_V[layer, sb] = Vk_code
+    st.V_scale[layer, sb] = Vk_s
+    st.quad_sig2[layer, sb] = S2r.to(st.quad_sig2.dtype)
+    st.quad_tag[layer, sb] = K[sb, page - 1, :, :tagw].to(st.quad_tag.dtype)
+    return int(sb.numel())

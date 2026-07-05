@@ -1,0 +1,89 @@
+# pyproject.toml -- standalone release metadata for the AMASS pip package.
+#
+# This tree is SELF-CONTAINED: it is not the research-repo root pyproject (that
+# one builds the separate `kvcomp` harness). `packaging/build.sh` stages a
+# snapshot of the live `src/amass` into `src/amass` next to this file, then
+# builds the sdist + wheel from here.
+#
+# Distribution name = `amass-kv` (PyPI). Import name = `amass` (`import amass`).
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amass-kv"
+version = "0.1.0"
+description = "AMASS: decode-time sparse KV-cache attention for vLLM (quad page-score selector + DRAM value tier)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Junsung Hwang", email = "junsung.k.hwang@gmail.com" },
+]
+keywords = [
+  "vllm", "kv-cache", "sparse-attention", "llm-inference",
+  "decode", "long-context", "flash-attention", "cuda",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Environment :: GPU :: NVIDIA CUDA",
+]
+
+# Runtime deps that are ALWAYS needed once you touch a kernel (the whole point
+# of the package). Kept minimal + floors-only so AMASS drops into an existing
+# CUDA/torch deployment without fighting the resolver. `numpy` is intentionally
+# absent: nothing under `amass/` imports it directly (it arrives transitively
+# via torch). See README "Dependencies".
+dependencies = [
+  "torch>=2.4",
+  "triton>=3.0",
+]
+
+[project.optional-dependencies]
+# vLLM is the plugin host. It is REQUIRED for the backend/plugin path but is a
+# heavy, CUDA-ABI-sensitive wheel that real deployments pin themselves, so we
+# ship it as an extra rather than a hard floor that could upgrade a pinned
+# engine out from under the user. Install AMASS into your existing vLLM env, or
+# `pip install amass-kv[vllm]` to pull a compatible engine.
+vllm = ["vllm>=0.8"]
+# YAML `AMASS_CONFIG` files (JSON configs work with no extra dep).
+yaml = ["pyyaml>=6.0"]
+# `amass-bench e2e` tokenizes a real model (lazy `transformers` import); it also
+# needs the `vllm` extra to spin up an engine.
+bench = ["transformers>=4.40"]
+# Everything for the full plugin + bench + yaml experience.
+all = ["vllm>=0.8", "transformers>=4.40", "pyyaml>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/Js-Hwang1/amass-kv"
+Repository = "https://github.com/Js-Hwang1/amass-kv"
+Issues = "https://github.com/Js-Hwang1/amass-kv/issues"
+
+# Console script: `amass-bench <kernels|e2e|all>`.
+[project.scripts]
+amass-bench = "amass.bench.cli:main"
+
+# vLLM general-plugin auto-registration: with the wheel installed, vLLM calls
+# this at engine startup with NO import needed in user code, and AMASS patches
+# itself in as the attention backend.
+[project.entry-points."vllm.general_plugins"]
+amass = "amass.backend.register:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["amass*"]
+
+[tool.setuptools.package-data]
+# The CUDA kernels are `.py` sources compiled at runtime via `load_inline`, so
+# they ship as ordinary modules (no data files). Nothing extra to include.
+amass = []
