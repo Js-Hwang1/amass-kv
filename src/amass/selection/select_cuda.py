@@ -120,7 +120,13 @@ __global__ void topb_select_kernel(
     int*   kbuf = hist + 256;                                // P_PAD
     __shared__ int   thtot[MAXBLK];                          // per-thread chunk sum
     __shared__ int   warp_ex[32];                            // per-warp offsets
-    __shared__ int   s_sel, s_k;                             // radix bucket + rank
+    __shared__ int   s_sel, s_k, s_cb;                       // radix bucket/rank/count
+
+    // PDL: when launched with the programmatic-stream-serialization
+    // attribute (AMASS_PDL=1), this grid starts while the SCORE kernel
+    // drains; everything above is score-independent prologue and the wait
+    // (no-op without an armed dependency) fences before the score read.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- cache all page scores into smem (one coalesced global read) ----
     for (int i = tid; i < P_PAD; i += BLK)
@@ -173,20 +179,35 @@ __global__ void topb_select_kernel(
                 int cl = __ffs(bal) - 1;             // crossing lane
                 if (lane == cl) {
                     int acc = above, sel = cl * 8;
+                    int cb  = 0;                     // crossing-bucket count
                     #pragma unroll
                     for (int d = cl * 8 + 7; d >= cl * 8; --d) {
                         int c = hist[d];
-                        if (acc + c >= k) { sel = d; break; }
+                        if (acc + c >= k) { sel = d; cb = c; break; }
                         acc += c;
                     }
                     s_sel = sel;
                     s_k   = k - acc;                 // residual rank in the bucket
+                    s_cb  = cb;
                 }
             }
             __syncthreads();
             prefix |= ((unsigned)s_sel) << shift;
-            kmask  |= 0xFFu << shift;
             k       = s_k;
+            // EARLY EXIT (bitwise-safe): when the residual rank equals the
+            // crossing-bucket count, tau_ref is the SMALLEST element carrying
+            // this prefix, so keep(score >= tau_ref) == keep(key >= prefix
+            // with all-zero low bits): no element with the prefix sits below
+            // tau_ref (it would be in the bucket), and every higher element
+            // differs in the already-fixed bits.  tau = u2f(prefix||0...0)
+            // yields the IDENTICAL kept set through the unchanged float
+            // compare, so the remaining radix passes cannot change anything.
+            // On clustered attention scores this fires at pass 2-3 for most
+            // steps (the radix was 4.3us of topb's 8.8us at bs1/16K;
+            // scratch_deepopt2/topb_probe.py).
+            if (k == s_cb)
+                break;
+            kmask  |= 0xFFu << shift;
             __syncthreads();
         }
         tau = u2f(prefix);                                // b-th largest value
@@ -256,6 +277,9 @@ __global__ void topb_select_kernel(
         if (kbuf[i] - prev == 1)                 // this page is kept
             page_table[tbase + (kbuf[i] - 1)] = i;
     }
+    // PDL: release a dependent decode kernel as this grid drains (no-op
+    // when none is armed).
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 void topb_select_cuda(torch::Tensor score, torch::Tensor npg,
@@ -263,7 +287,7 @@ void topb_select_cuda(torch::Tensor score, torch::Tensor npg,
                       torch::Tensor page_table, torch::Tensor page_cnt,
                       int64_t n_req, int64_t n_kv, int64_t n_sink,
                       int64_t mp, int64_t P_PAD, int64_t blk,
-                      int64_t prof_mode) {
+                      int64_t prof_mode, int64_t pdl) {
     TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be fp32");
     TORCH_CHECK(page_table.scalar_type() == at::kInt, "page_table int32");
     TORCH_CHECK(page_cnt.scalar_type() == at::kInt, "page_cnt int32");
@@ -284,6 +308,29 @@ void topb_select_cuda(torch::Tensor score, torch::Tensor npg,
     }
     dim3 grid((unsigned)n_req, (unsigned)n_kv);
     auto stream = at::cuda::getCurrentCUDAStream();
+    if (pdl) {
+        // programmatic dependent launch: overlap this grid's prologue with
+        // the tail of the preceding (score) kernel on the stream.  Captured
+        // into CUDA graphs as a programmatic edge (CUDA >= 12.0).
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid;
+        cfg.blockDim = dim3((unsigned)BLK);
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, topb_select_kernel,
+            score.data_ptr<float>(), npg.data_ptr<int>(), nsh.data_ptr<int>(),
+            bfix.data_ptr<int>(), page_table.data_ptr<int>(),
+            page_cnt.data_ptr<int>(), (int)n_sink,
+            (long)score.stride(0), (long)score.stride(1), (int)mp,
+            (long)page_table.stride(0), (long)page_table.stride(1),
+            (long)page_cnt.stride(0), (int)P_PAD, (int)prof_mode);
+        return;
+    }
     topb_select_kernel<<<grid, BLK, smem, stream>>>(
         score.data_ptr<float>(), npg.data_ptr<int>(), nsh.data_ptr<int>(),
         bfix.data_ptr<int>(), page_table.data_ptr<int>(),
@@ -336,8 +383,9 @@ def topb_select_cuda(st, n_req: int) -> None:
     blk = int(env) if env else (1024 if P_PAD > 1024 else 512)
     blk = max(32, min(1024, (blk // 32) * 32))           # 32..1024, multiple of 32
     prof = int(os.environ.get("AMASS_TOPB_PROF", "0"))   # 0 full,1 radix,2 compact
+    pdl = int(os.environ.get("AMASS_PDL", "1"))          # programmatic launch
     mod.topb_select_cuda(
         st.score, st.n_pages, st.n_sel_hi, st.b_fix,
         st.page_table, st.page_cnt,
         int(n_req), int(n_kv), int(st.sink_pages), int(MP),
-        int(P_PAD), blk, prof)
+        int(P_PAD), blk, prof, pdl)

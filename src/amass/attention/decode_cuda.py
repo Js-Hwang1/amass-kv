@@ -444,10 +444,6 @@ __global__ __launch_bounds__(WFT) void amass_decode_fused(
   const int gid  = lane >> 2;              // 0..7  (mma row group)
   const int t4   = lane & 3;               // 0..3
 
-  const int c = cnt[(long)r * cntr + kh];  // selected pages for (r,kh)
-  const int seq_len = sl[r];
-  const int nwaves = (c + NPG - 1) / NPG;
-
   // ---- shared memory layout --------------------------------------------- //
   // Qs[16*128] | Ks[FWAVES][NPG][16*136] | Vs[FWAVES][NPG][16*136]
   //   | (fp32) accsm[NPG][16*128] | msm[NPG*16] | lsm[NPG*16] | Msm[16] | Lsm[16]
@@ -461,13 +457,20 @@ __global__ __launch_bounds__(WFT) void amass_decode_fused(
   float* Msm   = lsm + NPG * 16;                              // [16]
   float* Lsm   = Msm + 16;                                    // [16]
 
-  // stage Q (rows >= G zeroed)
+  // stage Q FIRST (selection-independent) so a programmatic dependent launch
+  // overlaps it with the tail of topb, then fence before reading topb's
+  // page_table/page_cnt (griddepcontrol.wait is a no-op when not armed).
   const __nv_bfloat16* qb = q + (long)r * q_st + (long)kh * G * q_sh;
   const __nv_bfloat16 zbf = __float2bfloat16(0.0f);
   for (int i = tid; i < 16 * DMAX; i += WFT) {
     int row = i >> 7, col = i & 127;
     Qs[i] = (row < G) ? qb[(long)row * q_sh + col] : zbf;
   }
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const int c = cnt[(long)r * cntr + kh];  // selected pages for (r,kh)
+  const int seq_len = sl[r];
+  const int nwaves = (c + NPG - 1) / NPG;
 
   // cooperative loader: WAVE wv = NPG pages, one per group, into ring `buf`.
   // group pg loads page (wv*NPG+pg) with its own 128 threads (4 D-warps); a
@@ -697,11 +700,40 @@ void amass_decode_fused_launch(
   auto vptr = reinterpret_cast<const __nv_bfloat16*>(v.data_ptr());
   auto qptr = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr());
   auto optr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  const bool pdl = [] {
+    const char* e = getenv("AMASS_PDL");
+    return e == nullptr || e[0] != '0';
+  }();
   auto run = [&](auto kern) {
     if (smem > 48 * 1024) {
       C10_CUDA_CHECK(cudaFuncSetAttribute(
           (const void*)kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
           (int)smem));
+    }
+    if (pdl) {
+      // programmatic dependent launch: overlap the Q-staging prologue with
+      // the tail of topb (the kernel fences via griddepcontrol.wait before
+      // reading page_table/page_cnt).  Graph-capturable (CUDA >= 12.0).
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = grid;
+      cfg.blockDim = block;
+      cfg.dynamicSmemBytes = smem;
+      cfg.stream = stream;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      cudaLaunchKernelEx(&cfg, kern,
+        qptr, kptr, vptr, bt.data_ptr<int>(), tab.data_ptr<int>(),
+        cnt.data_ptr<int>(), sl.data_ptr<int>(), optr, (float)scale,
+        (int)n_kv, (int)G,
+        (long)q.stride(0), (long)q.stride(1),
+        (long)k.stride(0), (long)k.stride(1), (long)k.stride(2),
+        (long)v.stride(0), (long)v.stride(1), (long)v.stride(2),
+        (long)bt.stride(0), (long)tab.stride(0), (long)tab.stride(1),
+        (long)cnt.stride(0), (long)out.stride(0), (long)out.stride(1));
+      return;
     }
     kern<<<grid, block, smem, stream>>>(
       qptr, kptr, vptr, bt.data_ptr<int>(), tab.data_ptr<int>(),

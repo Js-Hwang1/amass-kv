@@ -16,10 +16,20 @@ Reference math per (req, kv-head, page), dequantizing the int8 summary in-kernel
 Dequant: mu = mu_code * mu_scale (per (block,head)); V = V_code * V_scale[k]
 (per-column r'); sig2 = quad_sig2 (fp16 eigenvalues).
 
-TWO implementations behind one wrapper (``QUAD_CUDA_IMPL`` = ``i8`` default |
-``f32`` escape):
+THREE implementations behind one wrapper (``QUAD_CUDA_IMPL`` = ``i8w``
+default | ``i8`` | ``f32`` escape):
 
-* **I8 (default, r'=2 int8/int4 V)** -- the whole (3 x 128 x 8-groups) page dot
+* **I8W (default, r'=2 int8 V, n_kv % 2 == 0)** -- the I8 math with WARP-OWNED
+  FULL-SLAB page streams: each warp loads its pages' codes as contiguous
+  KH-head slabs (KH=2 swept best; grid.y = n_kv/KH) and loops the KH heads
+  over the slab.  Fixes the measured wall of the per-(req,kv-head) I8 grid --
+  the 256B/128B per-head island gather ran at ~60% of the achievable HBM rate
+  and was 70%+ of kernel time at bs>=16 (deep-opt-2, scratch_deepopt2/):
+  1.15-1.47x over I8 across the grid, bitwise-identical scores.  Ships with a
+  PDL trigger (griddepcontrol) so a dependent topb overlaps this kernel's
+  drain (AMASS_PDL=1 default).
+* **I8 (r'=2 int8/int4 V; fallback for int4-V and odd n_kv)** -- the whole
+  (3 x 128 x 8-groups) page dot
   runs on the int8 TENSOR CORE as mma.m16n8k32.s8: A(16x32) = the query in
   2-limb int8 (rows 0-7 hi limbs of the 8 GQA groups, rows 8-15 lo limbs; the
   r8-validated precision recipe qi=round(q/qs), |qi|<=16383, hi=round(qi/128),
@@ -40,9 +50,14 @@ Layout (QuadState, per QUAD_IMPL_SPEC), physical-block keyed, L-major:
     quad_V     (L, NB, n_kv, d, r')  int8   + V_scale  (L, NB, n_kv, r') fp16
     quad_sig2  (L, NB, n_kv, r')     fp16   (int4 V packs 2 nibbles/byte: d,r'/2)
 
-Fixed launch shapes, no host sync, no allocation -> full-CUDA-graph safe.
+Fixed launch shapes, no host sync, no allocation -> full-CUDA-graph safe
+(PDL edges are graph-capturable programmatic dependencies).
 Tunables: QUAD_CUDA_{WARPS,ZSPLIT,NSTAGE,RP} (f32), QI8_{WARPS,NSTAGE,ZSPLIT}
-(i8); QUAD_PTXAS_V=1 prints ptxas register/occupancy.
+(i8), QI8W_{KH,ZSPLIT,MINCTAS} (i8w; WARPS/NSTAGE locked by measurement),
+AMASS_PDL (default 1); QUAD_PTXAS_V=1 prints ptxas register/occupancy.
+Measured negatives (deep-opt-2, do not retry): all-heads-per-CTA lockstep
+(i8f), KH=8/4 slabs, packed-Af LDS.128 (register/occupancy), launch_bounds
+minctas 12/14 (spills), NSTAGE>2 (needs a deeper prologue; static_assert).
 """
 from __future__ import annotations
 
@@ -59,6 +74,11 @@ _TARGET_BLK = int(os.environ.get("QUAD_CUDA_TARGET_BLK", "4096"))
 _I8_WARPS = int(os.environ.get("QI8_WARPS", "4"))
 _I8_NSTAGE = int(os.environ.get("QI8_NSTAGE", "4"))
 _I8_ZSPLIT = int(os.environ.get("QI8_ZSPLIT", "0"))
+
+_I8W_WARPS = int(os.environ.get("QI8W_WARPS", "4"))
+_I8W_NSTAGE = int(os.environ.get("QI8W_NSTAGE", "2"))
+_I8W_ZSPLIT = int(os.environ.get("QI8W_ZSPLIT", "0"))
+_I8W_KH = int(os.environ.get("QI8W_KH", "2"))     # kv-heads per CTA (slab width)
 
 
 def _zsplit(n_req: int, n_kv: int) -> int:
@@ -626,6 +646,361 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+# =========================================================================== #
+# I8W kernel: the QI8 math with WARP-OWNED FULL-SLAB page streams (deep-opt-2).
+#
+# WHY (measured, scratch_deepopt2/score_decomp.py + slab probe + i8f_bench):
+# the per-(req,kv-head) grid of the I8 kernel gathers each page's codes as 8
+# separate islands (V 256B + mu 128B + 3 scattered scalars per head) -> the
+# gather runs at ~60% of the achievable HBM rate and is 70%+ of kernel time at
+# bs>=16 (load-only 125us vs 56us for the same bytes read as whole slabs,
+# bs16/64K).  The B-fragment-build issue cost was measured NOT the wall
+# (planar-deinterleave A/B neutral; compute-only 67us << load-only 125us).
+# A CTA-lockstep all-heads-per-CTA variant (i8f) was BITWISE-correct but
+# SLOWER (0.38-0.99x): the per-pair __syncthreads convoy at ~4 CTAs/SM erased
+# the slab-gather win -> the fix must keep INDEPENDENT per-warp streams.
+#
+# I8W: one WARP owns a page-PAIR stream (grid (req,1,Z), 4 warps/CTA, worker
+# stride Z*4 -- the I8 shape) and loads each page's FULL contiguous slabs
+#   V  blk*(n_kv*256)B | mu blk*(n_kv*128)B | vvs+sig2+mus (3 16B chunks)
+# into its own DOUBLE-BUFFERED ring (prefetch pair k+1 issued BEFORE
+# cp.async.wait_group 1 of pair k), then loops the n_kv heads over the slab:
+# per head it re-reads the hoistable A fragments from the q-code smem (staged
+# once per CTA for all n_kv*G <= 64 heads) and runs the I8 kernel's exact
+# 4-mma + epilogue.  8x coarser gather (DRAM-row friendly), 24 scattered
+# requests/page -> 5, zero cross-warp sync in the hot loop.  Math, epilogue
+# float order, and stores are IDENTICAL to the I8 kernel -> scores BITWISE
+# EQUAL (gated in tests + scratch_deepopt2/i8f_bench.py).
+# =========================================================================== #
+_CUDA_SRC_I8W = r"""
+#include <torch/extension.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#ifndef QI8W_WARPS
+#define QI8W_WARPS 4
+#endif
+#ifndef QI8W_NSTAGE
+#define QI8W_NSTAGE 2
+#endif
+// The ring is a hard double buffer: the prologue primes ONE slot and the loop
+// prefetches pair k+1 then cp.async.wait_group 1.  Deeper NSTAGE would need
+// an (NSTAGE-1)-deep prologue + wait<NSTAGE-1>; building with NSTAGE=3 as-is
+// reads slot k before its load lands (measured BITWISE-FAIL, i8w_knobs.log)
+// and showed no speed win -- locked out.
+static_assert(QI8W_NSTAGE == 2, "qi8w ring is a hard double buffer");
+#ifndef QI8W_KH            // kv-heads per CTA (slab width); 2, 4 or 8
+#define QI8W_KH 4
+#endif
+
+#define DMAX 128
+#define PAGE 16
+#define GMX  8
+#define RP   2
+#define QLIM 16383
+#define QROW 36            // q-code row stride in words (128B + 16B pad):
+// the per-(pair,kh) A-fragment re-reads index a DIFFERENT row per lane
+// (hg = kh*G + gid) -- an unpadded 32-word stride puts all 8 gid rows on the
+// same bank (8-way conflict on EVERY Af load, ~1000 serialized LSU cycles per
+// pair, the measured killer of i8w-v1); 36 staggers rows 4 banks apart.
+// A PACKED layout serving the re-read as 4x LDS.128 was MEASURED SLOWER
+// (bs16/16K 41.7 -> 59.1us): the uint4 temporaries push registers 48 -> 72,
+// occupancy 10 -> 7 CTAs/SM, and the kernel is OCCUPANCY-bound, not
+// LDS-count-bound (scratch_deepopt2/i8w_af_ab.py).  Keep 16x LDS.32.
+
+// slot geometry (compile-time from QI8W_KH):
+//   V slab   KH*256 B @ 0        | mu slab KH*128 B @ MUOFF (+32B stagger)
+//   scales   vvs @ SCOFF, sig2 @ SCOFF+32, mus @ SCOFF+64 (32B strides)
+//   page B   @ PBLK = round128(SCOFF+96) + 64  (16-bank offset from page A)
+#define MUOFF (QI8W_KH * 256 + 32)
+#define SCOFF (MUOFF + QI8W_KH * 128)
+#define PBLK  ((((SCOFF + 96) + 127) / 128) * 128 + 64)
+#define SLOT_BYTES (2 * PBLK)
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+    unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
+    unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N> __device__ __forceinline__ void cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+__device__ __forceinline__ void mma_s8(int d[4], const unsigned a[4],
+                                       const unsigned b[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+#ifndef QI8W_MINCTAS
+#define QI8W_MINCTAS 0     // optional launch_bounds minBlocks (occupancy A/B)
+#endif
+#if QI8W_MINCTAS > 0
+__global__ __launch_bounds__(QI8W_WARPS * 32, QI8W_MINCTAS) void
+#else
+__global__ __launch_bounds__(QI8W_WARPS * 32) void
+#endif
+qi8w_score_kernel(
+    const __nv_bfloat16* __restrict__ q,     // (T,H,d)
+    const int8_t*  __restrict__ mu,          // (NB,n_kv,d)
+    const __half*  __restrict__ mus,         // (NB,n_kv)
+    const int8_t*  __restrict__ vv,          // (NB,n_kv,d,r')
+    const __half*  __restrict__ vvs,         // (NB,n_kv,r')
+    const __half*  __restrict__ sig2,        // (NB,n_kv,r')
+    const int*     __restrict__ bt,          // (n_req, bt_stride)
+    const int*     __restrict__ nsh,         // (R,)
+    float*         __restrict__ score,       // (R,n_kv,MP)
+    const float scale, const int n_kv, const int G,
+    const long q_st, const long q_hs,
+    const long mu_sb, const long mus_sb, const long v_sb,
+    const long vs_sb, const long sg_sb,
+    const int bt_stride,
+    const long sc_sr, const long sc_sh, const int MP)
+{
+    const int req  = blockIdx.x;
+    const int kh0  = blockIdx.y * QI8W_KH;     // first kv-head of this CTA
+    const int zsp  = blockIdx.z;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nselhi = nsh[req];
+    const int gid  = lane >> 2;                // 0..7
+    const int t4   = lane & 3;                 // 0..3
+
+    // dynamic smem: per-warp slab rings | q codes (hi, lo, qsc) for KH*G rows
+    extern __shared__ int8_t dsmem[];
+    int8_t* ring = dsmem;
+    unsigned* qhi_w = reinterpret_cast<unsigned*>(
+        dsmem + (long)QI8W_WARPS * QI8W_NSTAGE * SLOT_BYTES);
+    unsigned* qlo_w = qhi_w + (long)QI8W_KH * GMX * QROW;
+    float*    qsc_sh = reinterpret_cast<float*>(qlo_w + (long)QI8W_KH * GMX * QROW);
+
+    // ---- q -> 2-limb int8 for this CTA's KH*G heads (once per CTA) --------- //
+    const int nrows = QI8W_KH * G;
+    for (int h = warp; h < QI8W_KH * GMX; h += QI8W_WARPS) {
+        float v4[4] = {0.f, 0.f, 0.f, 0.f};
+        if (h < nrows) {
+            const __nv_bfloat16* qg =
+                q + (long)req * q_st + (long)(kh0 * G + h) * q_hs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                v4[j] = __bfloat162float(qg[lane * 4 + j]);
+        }
+        float mx = fmaxf(fmaxf(fabsf(v4[0]), fabsf(v4[1])),
+                         fmaxf(fabsf(v4[2]), fabsf(v4[3])));
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+        const float qs = fmaxf(mx, 1e-12f) / (float)QLIM;
+        unsigned hw = 0, lw = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int qi = __float2int_rn(v4[j] / qs);
+            qi = max(-QLIM, min(QLIM, qi));
+            int h2 = __float2int_rn(qi * (1.f / 128.f));
+            h2 = max(-127, min(127, h2));
+            int l = max(-127, min(127, qi - h2 * 128));
+            hw |= (unsigned)((unsigned char)(signed char)h2) << (8 * j);
+            lw |= (unsigned)((unsigned char)(signed char)l) << (8 * j);
+        }
+        qhi_w[h * QROW + lane] = (h < nrows) ? hw : 0u;
+        qlo_w[h * QROW + lane] = (h < nrows) ? lw : 0u;
+        if (lane == 0) qsc_sh[h] = qs;
+    }
+    __syncthreads();
+
+    const float qcoef = scale * scale / (2.f * (float)PAGE);
+    const int half = t4 >> 1;                  // this lane's page-half of C
+
+    // ---- per-warp double-buffered ring of page-PAIR slabs ------------------ //
+    int8_t* wring = ring + (long)warp * QI8W_NSTAGE * SLOT_BYTES;
+    const int nworker = gridDim.z * QI8W_WARPS;
+    const int wid = zsp * QI8W_WARPS + warp;
+    const int npair_hi = (nselhi + 1) >> 1;
+
+    auto load_page = [&](int p, int8_t* dst) {
+        const int blk = bt[(long)req * bt_stride + p];
+        const int8_t* vg = vv + (long)blk * v_sb  + (long)kh0 * 256;
+        const int8_t* mg = mu + (long)blk * mu_sb + (long)kh0 * 128;
+        #pragma unroll
+        for (int i = lane; i < QI8W_KH * 16; i += 32)
+            cp_async16(dst + i * 16, vg + i * 16);
+        #pragma unroll
+        for (int i = lane; i < QI8W_KH * 8; i += 32)
+            cp_async16(dst + MUOFF + i * 16, mg + i * 16);
+        // scales as 4B chunks (uniform across KH; 3 tiny arrays)
+        const int8_t* sv = (const int8_t*)(vvs  + (long)blk * vs_sb + kh0 * RP);
+        const int8_t* sg = (const int8_t*)(sig2 + (long)blk * sg_sb + kh0 * RP);
+        const int8_t* sm = (const int8_t*)(mus  + (long)blk * mus_sb + kh0);
+        if (lane < QI8W_KH)
+            cp_async4(dst + SCOFF + lane * 4, sv + lane * 4);
+        else if (lane < 2 * QI8W_KH)
+            cp_async4(dst + SCOFF + 32 + (lane - QI8W_KH) * 4,
+                      sg + (lane - QI8W_KH) * 4);
+        else if (lane < 2 * QI8W_KH + QI8W_KH / 2)
+            cp_async4(dst + SCOFF + 64 + (lane - 2 * QI8W_KH) * 4,
+                      sm + (lane - 2 * QI8W_KH) * 4);
+    };
+    auto load_pair = [&](int pp, int slot) {
+        int8_t* sl8 = wring + (long)slot * SLOT_BYTES;
+        const int p0 = 2 * pp, p1 = 2 * pp + 1;
+        load_page(p0, sl8);
+        if (p1 < nselhi) load_page(p1, sl8 + PBLK);
+    };
+
+    int npairs = 0;
+    for (int pp = wid; pp < npair_hi; pp += nworker) npairs++;
+    if (npairs > 0) { load_pair(wid, 0); }
+    cp_commit();
+
+    for (int k = 0; k < npairs; ++k) {
+        const int pp = wid + k * nworker;
+        const int slot = k % QI8W_NSTAGE;
+        // prefetch pair k+1 BEFORE waiting on pair k (double buffer)
+        if (k + 1 < npairs)
+            load_pair(wid + (k + 1) * nworker, (k + 1) % QI8W_NSTAGE);
+        cp_commit();
+        cp_wait<QI8W_NSTAGE - 1>();
+        __syncwarp();
+        const int8_t* sl8 = wring + (long)slot * SLOT_BYTES;
+        const int p0 = 2 * pp, p1 = 2 * pp + 1;
+        const int pmy = half ? p1 : p0;
+        const int8_t* pb8 = sl8 + (half ? PBLK : 0);
+        const int  pvalid = (pmy < nselhi);
+
+        // ---- loop this CTA's kv-heads over the slab -------------------- //
+        #pragma unroll
+        for (int kh = 0; kh < QI8W_KH; ++kh) {
+            // A fragments for head (kh0+kh, gid) re-read from the q-code smem
+            const int hg = (kh * G + ((gid < G) ? gid : 0)) * QROW;
+            unsigned Af[4][4];
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                Af[kk][0] = (gid < G) ? qhi_w[hg + kk * 8 + t4]     : 0u;
+                Af[kk][1] = (gid < G) ? qlo_w[hg + kk * 8 + t4]     : 0u;
+                Af[kk][2] = (gid < G) ? qhi_w[hg + kk * 8 + t4 + 4] : 0u;
+                Af[kk][3] = (gid < G) ? qlo_w[hg + kk * 8 + t4 + 4] : 0u;
+            }
+            const float qs = (gid < G) ? qsc_sh[kh * G + gid] : 0.f;
+            float musf = 0.f;
+            if (pvalid && (t4 & 1) == 1)
+                musf = __half2float(
+                    reinterpret_cast<const __half*>(pb8 + SCOFF + 64)[kh]);
+
+            int  acc[4] = {0, 0, 0, 0};
+            const int col = gid & 3;
+            const int pb  = gid >> 2;
+            const int8_t* base   = sl8 + (pb ? PBLK : 0);
+            const int8_t* vbase  = base + kh * 256;
+            const int8_t* mubase = base + MUOFF + kh * 128;
+            const unsigned psel = (col == 1) ? 0x7531u : 0x6420u;
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                unsigned b[2];
+                if (col < 2) {
+                    const unsigned* vw = reinterpret_cast<const unsigned*>(
+                        vbase + (kk * 32 + t4 * 4) * 2);
+                    unsigned w0 = vw[0], w1 = vw[1], w2 = vw[8], w3 = vw[9];
+                    b[0] = __byte_perm(w0, w1, psel);
+                    b[1] = __byte_perm(w2, w3, psel);
+                } else if (col == 2) {
+                    const unsigned* mw = reinterpret_cast<const unsigned*>(
+                        mubase + kk * 32 + t4 * 4);
+                    b[0] = mw[0]; b[1] = mw[4];
+                } else {
+                    b[0] = 0u; b[1] = 0u;
+                }
+                mma_s8(acc, Af[kk], b);
+            }
+
+            // ---- epilogue: IDENTICAL float sequence to the I8 kernel ---- //
+            const int comb0 = 128 * acc[0] + acc[2];
+            const int comb1 = 128 * acc[1] + acc[3];
+            const __half2 vvs2 = *reinterpret_cast<const __half2*>(
+                pb8 + SCOFF + kh * RP * 2);
+            const __half2 sg2  = *reinterpret_cast<const __half2*>(
+                pb8 + SCOFF + 32 + kh * RP * 2);
+            float S = -CUDART_INF_F;
+            float qmu_own = (float)comb0 * qs * musf * scale;
+            float qmu = __shfl_sync(~0u, qmu_own, lane | 1);
+            if ((t4 & 1) == 0 && pvalid && gid < G) {
+                const float2 vs = __half22float2(vvs2);
+                const float2 sg = __half22float2(sg2);
+                const float qh0 = (float)comb0 * qs * vs.x;
+                const float qh1 = (float)comb1 * qs * vs.y;
+                S = qmu + qcoef * (sg.x * qh0 * qh0 + sg.y * qh1 * qh1);
+            }
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
+            if (lane == 0)
+                score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p0] = S;
+            if (lane == 2 && p1 < nselhi)
+                score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p1] = S;
+        }
+    }
+    // PDL: release dependents (e.g. topb launched with the programmatic-
+    // stream-serialization attribute) as this grid drains; the instruction
+    // is a no-op when no dependent is armed.  Prior stores of this thread
+    // are visible to a dependent that executes griddepcontrol.wait.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+void qi8w_score_launch(
+    torch::Tensor q, torch::Tensor mu, torch::Tensor mus,
+    torch::Tensor vv, torch::Tensor vvs, torch::Tensor sig2,
+    torch::Tensor bt, torch::Tensor nsh, torch::Tensor score,
+    double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t MP,
+    int64_t zsplit)
+{
+    TORCH_CHECK(n_kv % QI8W_KH == 0, "qi8w: n_kv must be a multiple of KH");
+    TORCH_CHECK(G <= 8, "qi8w: G must be <= 8");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    size_t qcodes = (size_t)QI8W_KH * GMX * QROW * 2 * 4 + QI8W_KH * GMX * 4;
+    size_t smem = (size_t)QI8W_WARPS * QI8W_NSTAGE * SLOT_BYTES + qcodes;
+    dim3 grid((unsigned)n_req, (unsigned)(n_kv / QI8W_KH), (unsigned)zsplit);
+    dim3 block((unsigned)(QI8W_WARPS * 32));
+    if (smem > 48 * 1024) {
+        static size_t recorded = 0;
+        if (smem > recorded) {
+            cudaFuncSetAttribute(qi8w_score_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            recorded = smem;
+        }
+    }
+    qi8w_score_kernel<<<grid, block, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        mu.data_ptr<int8_t>(),
+        reinterpret_cast<const __half*>(mus.data_ptr()),
+        vv.data_ptr<int8_t>(),
+        reinterpret_cast<const __half*>(vvs.data_ptr()),
+        reinterpret_cast<const __half*>(sig2.data_ptr()),
+        bt.data_ptr<int>(), nsh.data_ptr<int>(),
+        score.data_ptr<float>(),
+        (float)scale, (int)n_kv, (int)G,
+        (long)q.stride(0), (long)q.stride(1),
+        (long)mu.stride(0), (long)mus.stride(0), (long)vv.stride(0),
+        (long)vvs.stride(0), (long)sig2.stride(0),
+        (int)bt.stride(0),
+        (long)score.stride(0), (long)score.stride(1), (int)MP);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("qi8w_score_launch", &qi8w_score_launch,
+          "AMASS quad page score, int8 tensor core, warp-owned slab streams");
+}
+"""
+
+
 _MODS = {}   # rp -> loaded extension
 
 
@@ -646,6 +1021,51 @@ def _get(rp: int = 2):
     mod = load_inline(
         name=f"amass_quad_score_{suffix}",
         cpp_sources="", cuda_sources=_CUDA_SRC,
+        extra_cuda_cflags=flags, verbose=_verbose)
+    _MODS[key] = mod
+    return mod
+
+
+def _zsplit_i8w(n_req: int, n_kv: int, max_pages: int, kh: int = None) -> int:
+    """grid.z for the warp-owned-slab kernel (4-warp CTAs, worker = warp,
+    grid.y = n_kv/KH).  Heavier workers than the I8 kernel (each pair is a
+    KH-head slab): ~1024 warp streams saturates; z <= MP/16 keeps >= ~4 pairs
+    per stream so the double buffer stays primed.  Swept on H200
+    (scratch_deepopt2/i8f_bench.py I8W section)."""
+    if _I8W_ZSPLIT > 0:
+        return _I8W_ZSPLIT
+    if kh is None:
+        kh = _I8W_KH
+    # Fitted to the H200 z-sweep (scratch_deepopt2/i8f_bench.json): streams
+    # want ~1 pair each at low batch (latency-bound, fill the machine) and
+    # ~8 pairs each once n_req*khg covers the SMs (bs>=16).
+    per = max(1, n_req * max(1, n_kv // kh))
+    pairs = max(1, max_pages // 2)
+    div = min(8, max(1, per // 8))
+    z = (pairs + div * 4 - 1) // (div * 4)
+    return max(4, min(256, z))
+
+
+def _get_i8w(kh: int = None):
+    """Build (once, hash-cached) the warp-owned-slab int8 tensor-core kernel."""
+    if kh is None:
+        kh = _I8W_KH
+    key = ("i8w", _I8W_WARPS, _I8W_NSTAGE, kh)
+    if key in _MODS:
+        return _MODS[key]
+    from torch.utils.cpp_extension import load_inline
+    flags = ["-O3", "--use_fast_math",
+             f"-DQI8W_WARPS={_I8W_WARPS}", f"-DQI8W_NSTAGE={_I8W_NSTAGE}",
+             f"-DQI8W_KH={kh}",
+             "-gencode=arch=compute_90a,code=sm_90a"]
+    suffix = f"w{_I8W_WARPS}s{_I8W_NSTAGE}k{kh}"
+    _verbose = os.environ.get("QUAD_PTXAS_V", "0") != "0"
+    if _verbose:
+        flags.append("-Xptxas=-v")
+        suffix += "_v"
+    mod = load_inline(
+        name=f"amass_quad_score_i8w_{suffix}",
+        cpp_sources="", cuda_sources=_CUDA_SRC_I8W,
         extra_cuda_cflags=flags, verbose=_verbose)
     _MODS[key] = mod
     return mod
@@ -697,10 +1117,27 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
     mu, mu_s, V, V_s, sig2 = _quad_layer_state(st, layer)
     # rank r': prefer explicit ``rp``/``r`` attrs (QuadState); int8 V last dim == r'.
     rp = int(getattr(st, "rp", None) or getattr(st, "r", V.shape[-1]))
-    impl = os.environ.get("QUAD_CUDA_IMPL", "i8")
+    impl = os.environ.get("QUAD_CUDA_IMPL", "i8w")
     if rp == 2 and impl != "f32":
         # V last dim: r' (int8) or r'/2 (int4 packed nibbles along r')
         v_bits = 8 if V.shape[-1] == rp else 4
+        n_kv, G = int(st.n_kv), int(st.G)
+        # warp-owned-SLAB kernel (i8w, the default): each warp reads each of
+        # its pages' codes as contiguous KH-head slabs (grid.y = n_kv/KH) and
+        # loops the KH heads -> KHx coarser gather (the measured wall;
+        # scratch_deepopt2).  Guards: int8 V, r'=2, n_kv divisible by KH,
+        # contiguous per-block slabs.
+        if (impl == "i8w" and v_bits == 8 and n_kv % _I8W_KH == 0
+                and G <= 8
+                and V.stride(1) == 128 * rp and mu.stride(1) == 128):
+            mod = _get_i8w()
+            mod.qi8w_score_launch(
+                q, mu, mu_s, V, V_s, sig2,
+                block_table, st.n_sel_hi, st.score,
+                float(scale), int(n_req), n_kv, G,
+                int(st.max_pages),
+                int(_zsplit_i8w(int(n_req), n_kv, int(st.max_pages))))
+            return
         mod = _get_i8(v_bits)
         mod.qi8_score_launch(
             q, mu, mu_s, V, V_s, sig2,
