@@ -85,19 +85,25 @@ def _worker(cfg: Dict) -> Dict:
     ctx = cfg["ctx"]
     tok = AutoTokenizer.from_pretrained(hf_id)
 
-    # synthetic prompt sized to ~ctx tokens (deterministic, no dataset needed)
+    # synthetic prompts sized to ~ctx tokens (deterministic, no dataset needed).
+    # DISTINCT per request (unique header) + prefix caching OFF so every request
+    # owns its physical KV blocks -- otherwise identical prompts share prefix
+    # blocks and the measured KV-read volume is 1/nreq of the honest workload.
     unit = ("The archivists of the floating city catalogued every brass device "
             "with meticulous, unhurried care. ")
     ntok_unit = max(1, len(tok.encode(unit, add_special_tokens=False)))
     prompt = unit * max(1, (ctx // ntok_unit))
-    prompt_ids = tok.encode(prompt, add_special_tokens=False)[: ctx - 256]
     from vllm.inputs import TokensPrompt
-    prompt_obj = TokensPrompt(prompt_token_ids=prompt_ids)
-    prompts = [prompt_obj] * cfg["nreq"]
+    prompts = []
+    for i in range(cfg["nreq"]):
+        hdr = f"Archive shelf {i} of {cfg['nreq']} begins here. "
+        ids = tok.encode(hdr + prompt, add_special_tokens=False)[: ctx - 256]
+        prompts.append(TokensPrompt(prompt_token_ids=ids))
+    prompt_ids = prompts[0]["prompt_token_ids"]
 
     llm = LLM(model=hf_id, gpu_memory_utilization=cfg["gpu_util"],
               max_model_len=min(ctx + 512, 131072), enforce_eager=cfg["eager"],
-              max_num_seqs=cfg["nreq"],
+              max_num_seqs=cfg["nreq"], enable_prefix_caching=False,
               num_gpu_blocks_override=(cfg["gpu_blocks"]
                                        if mode != "fullkv" else None))
 
@@ -111,6 +117,16 @@ def _worker(cfg: Dict) -> Dict:
 
     timed_gen(8)  # warmup: graph capture + JIT build at both shapes
     timed_gen(cfg["n2"])
+    if os.environ.get("AMASS_CUDAPROF", "0") == "1":
+        # nsys attribution mode (scratch_deepopt3): profile exactly one short
+        # decode-heavy generate between cudaProfilerApi start/stop, then exit.
+        torch.cuda.profiler.start()
+        t = timed_gen(64)
+        torch.cuda.profiler.stop()
+        return {"mode": mode, "ctx": ctx, "nreq": cfg["nreq"], "prof_s": t,
+                "tpot_ms": float("nan"), "tok_per_s": 0.0, "eager": cfg["eager"],
+                "graph": not cfg["eager"], "budget": cfg["budget"],
+                "use_cuda": cfg["use_cuda"], "n_prompt_tok": len(prompt_ids)}
     N1, N2, reps = cfg["n1"], cfg["n2"], cfg["reps"]
     diffs = []
     for _ in range(reps):

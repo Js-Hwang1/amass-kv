@@ -29,8 +29,72 @@ import os
 
 import torch
 
-from .build import _eigh_jacobi, _quant_mu, _quant_vk
+from .build import (_build_blocks, _bulk_blocks, _delta_select, _eigh_jacobi,
+                    _page_eigh, _quant_mu, _quant_vk, _scatter_index,
+                    _tail_blocks)
 from .quad_state import QuadState
+
+
+# --------------------------------------------------------------------------- #
+def _quad_write(st: QuadState, Kp_flat: torch.Tensor, lidx: torch.Tensor,
+                bidx: torch.Tensor) -> None:
+    """Summarize + quantize + scatter ``Kp_flat`` (N, page, n_kv, d) into the
+    quad slabs at the flat (layer, block) index pairs.  Sync-free."""
+    page, r, tagw = st.page, st.r, st.tagw
+    tag_new = Kp_flat[:, page - 1, :, :tagw]
+    mu, _U8, _S8, S2r, Vk = _page_eigh(Kp_flat, r)
+    mu_code, mu_s = _quant_mu(mu)
+    Vk_code, Vk_s = _quant_vk(Vk, st.v_grain, st.v_bits)
+    st.quad_mu[lidx, bidx] = mu_code
+    st.mu_scale[lidx, bidx] = mu_s
+    st.quad_V[lidx, bidx] = Vk_code
+    st.V_scale[lidx, bidx] = Vk_s
+    st.quad_sig2[lidx, bidx] = S2r.to(st.quad_sig2.dtype)
+    st.quad_tag[lidx, bidx] = tag_new.to(st.quad_tag.dtype)
+
+
+def quad_build_tail(st: QuadState, K_layers, block_table: torch.Tensor,
+                    seq_lens: torch.Tensor, n_req: int, rows=None) -> int:
+    """Batched all-layer rebuild of the last finalized page of ``rows`` (or of
+    every request).  quad twin of :func:`amass.selection.build.r8_build_tail`
+    (see the rationale there): zero device syncs, idempotent.  Called by the
+    builder on steady finalize steps only."""
+    if n_req == 0:
+        return 0
+    L = len(K_layers)
+    blocks = _tail_blocks(block_table, seq_lens, n_req, st.page, rows)
+    if blocks.numel() == 0:
+        return 0
+    Kp_raw = torch.stack([K[blocks] for K in K_layers])   # (L,n,page,n_kv,d)
+    n = blocks.shape[0]
+    lidx, bidx = _scatter_index(L, 0, blocks)
+    _quad_write(st, Kp_raw.reshape(L * n, st.page, st.n_kv, st.d), lidx, bidx)
+    return L * n
+
+
+def quad_build_bulk(st: QuadState, K_layers, block_table: torch.Tensor,
+                    seq_lens: torch.Tensor, n_req: int, max_fin: int,
+                    chunk_pairs: int = 8192) -> int:
+    """Rebuild ALL finalized pages for ALL layers, zero syncs; quad twin of
+    :func:`amass.selection.build.r8_build_bulk` (rationale there)."""
+    if n_req == 0 or max_fin <= 0:
+        return 0
+    blocks = _bulk_blocks(block_table, seq_lens, n_req, page=st.page,
+                          max_fin=max_fin)
+    return _build_blocks(_quad_write, st, K_layers, blocks, chunk_pairs)
+
+
+def quad_build_delta(st: QuadState, K_layers, block_table: torch.Tensor,
+                     seq_lens: torch.Tensor, n_req: int, max_fin: int,
+                     chunk_pairs: int = 8192) -> int:
+    """Composition-change rebuild: only blocks whose content tag went stale;
+    quad twin of :func:`amass.selection.build.r8_build_delta` (rationale
+    there: one batched all-layer tag pass, rebuild stale blocks only)."""
+    if n_req == 0 or max_fin <= 0:
+        return 0
+    blocks = _delta_select(st.quad_tag, K_layers, block_table, seq_lens,
+                           n_req, st.page, max_fin, st.tagw)
+    return _build_blocks(_quad_write, st, K_layers, blocks, chunk_pairs)
 
 
 # --------------------------------------------------------------------------- #

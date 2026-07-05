@@ -23,8 +23,10 @@ hand-CUDA (Hopper) kernels.
 """
 from __future__ import annotations
 
-from .build import r8_build_refresh
-from .quad_build import quad_build_refresh
+from .build import (r8_build_bulk, r8_build_delta, r8_build_refresh,
+                    r8_build_tail)
+from .quad_build import (quad_build_bulk, quad_build_delta,
+                         quad_build_refresh, quad_build_tail)
 from .quad_score import quad_score, select_pages_quad
 from .quad_state import QuadState
 from .score import r8_score
@@ -35,6 +37,9 @@ __all__ = [
     "R8State",
     "TAGW",
     "r8_build_refresh",
+    "r8_build_tail",
+    "r8_build_bulk",
+    "r8_build_delta",
     "derive_page_params",
     "r8_score",
     "topb_select",
@@ -42,6 +47,9 @@ __all__ = [
     # ---- quad score mode (Gaussian-MGF quadratic; 3.4x smaller selector) ---- #
     "QuadState",
     "quad_build_refresh",
+    "quad_build_tail",
+    "quad_build_bulk",
+    "quad_build_delta",
     "quad_score",
     "select_pages_quad",
 ]

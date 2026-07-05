@@ -50,6 +50,8 @@ class AmassConfig:
     # (per-key low-rank logsumexp page-mass estimate mu/Vk/c, rank r8_rank).
     score: Literal["r8", "quad"] = "quad"
     quad_rank: int = 2             # quad rank r' (default 2; rank-insensitive)
+    # quad V-summary quant bits: 8=int8 (~4.7%), 4=int4 (~3.4% prod default)
+    v_bits: int = 8
 
     # ---- Stage B / tier (mem variants only) ------------------------------ #
     hot_slots: int = 2048          # hot-buffer slots per (layer, kv-head)
@@ -88,6 +90,8 @@ class AmassConfig:
             raise ValueError(f"score must be 'r8' or 'quad', got {self.score!r}")
         if self.quad_rank < 1:
             raise ValueError(f"quad_rank must be >= 1, got {self.quad_rank}")
+        if self.v_bits not in (4, 8):
+            raise ValueError(f"v_bits must be 4 or 8, got {self.v_bits}")
 
     # ---- construction ---------------------------------------------------- #
     @classmethod

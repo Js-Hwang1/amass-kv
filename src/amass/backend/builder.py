@@ -32,15 +32,42 @@ not capturable) forces ``NEVER`` -> attention runs eagerly between graph pieces.
 """
 from __future__ import annotations
 
+import os
 import traceback
 
 import torch
+
+# Profiling-only NVTX ranges (AMASS_NVTX=1): attribute the per-step host
+# prologue (FA build / refresh gate / derive) on an nsys timeline. Zero-cost
+# when off (module-level constant, no per-step env read).
+_NVTX = os.environ.get("AMASS_NVTX", "0") == "1"
+_nvtx_push = torch.cuda.nvtx.range_push
+_nvtx_pop = torch.cuda.nvtx.range_pop
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
 
 from ..attention.decode import _split_kv, ensure_stage_b_buffers
 from . import _runtime
+
+
+def _seq_lens_host(cam):
+    """Per-step HOST (CPU) seq lens, sync-free, WITHOUT the deprecated
+    ``seq_lens_cpu`` property.
+
+    vLLM 0.24 decorates ``CommonAttentionMetadata.seq_lens_cpu`` with
+    ``@typing_extensions.deprecated``; inside the engine that access pays the
+    warnings machinery EVERY step -- measured ~6.9 ms/decode-step (nsys +
+    perf_counter, scratch_deepopt3), the single largest AMASS host CPU cost.
+    The runner populates the same pinned CPU tensor in the plain (non-property)
+    field ``seq_lens_cpu_upper_bound`` (exact outside async spec decode, which
+    never reaches the pure-decode AMASS path); ``_seq_lens_cpu`` is the
+    deprecated-path backing store. Read those directly; fall back to None (gate
+    then refreshes every step, correct but slow)."""
+    sl = getattr(cam, "seq_lens_cpu_upper_bound", None)
+    if sl is None:
+        sl = getattr(cam, "_seq_lens_cpu", None)
+    return sl
 
 # split=128: measured Stage-B bandwidth knee at bs=1 (2064 vs 1674 GB/s @
 # split64) with no bs=4 regression (pps floors at PPS_MIN so the active-split
@@ -71,7 +98,9 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
         self._r8 = False          # True => real graph-safe r8 path
         self._capturing = False   # set during cudagraph-capture dummy builds
         self._layer_kv = None     # per-layer resident kv_cache tensor views
+        self._layer_k = None      # per-layer resident K-half views (tail build)
         self._prev_seq_lens = None  # host seq_lens snapshot (refresh-skip gate)
+        self._built_once = False  # first full build -> bulk; later -> tag delta
         self._tier = None         # amass.tier.Tier (mem variants; lazy)
         self._tier_tried = False
         # mem-v/mem-kv: the DRAM tier is built lazily at first build (needs
@@ -162,12 +191,16 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
             # STATIC selection is budget-driven; if only a coverage was given,
             # fall back to a fixed fraction (no adaptive per-head b).
             budget = cfg.budget if cfg.budget is not None else 0.1
+            # quad V-summary quant bits (int8 default / int4 prod); R8State does
+            # NOT take v_bits, so only thread it through the quad branch.
+            extra_state = {"v_bits": getattr(cfg, "v_bits", 8)} if quad else {}
             st = _State(
                 self._device, num_layers=len(self._layer_names),
                 num_blocks=int(nb), n_kv=n_kv, G=G, head_dim=self.headdim,
                 page=page, max_reqs=max_reqs, max_pages=max_pages,
                 rank=rank, budget=budget,
-                sink_pages=cfg.sink_pages, window_pages=cfg.window_pages)
+                sink_pages=cfg.sink_pages, window_pages=cfg.window_pages,
+                **extra_state)
             # Stage-B ownership lives in attention/; it reads st.D / st.max_reqs /
             # st.n_kv / st.G. R8State exposes .d (lowercase) -> alias it, and give
             # it a .scale slot (unused: the impl passes scale explicitly).
@@ -176,12 +209,16 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
             ensure_stage_b_buffers(st, self._device, _SPLIT)
             st._layer_of = ptr2layer
             self._layer_kv = layer_kv
+            # Per-layer resident K-half views (stable storage): the steady-state
+            # tail rebuild gathers from every layer each finalize step.
+            self._layer_k = [_split_kv(kvc)[0] for kvc in layer_kv]
             self._state = st
             print(f"[amass] {'QuadState' if quad else 'R8State'} ALLOCATED "
                   f"(score={getattr(cfg, 'score', 'r8')}): layers="
                   f"{st.L} num_blocks={st.NB} reqs={max_reqs} n_kv={n_kv} G={G} "
                   f"d={self.headdim} page={page} max_pages={max_pages} "
-                  f"rank={st.r} budget={budget} sink={cfg.sink_pages} "
+                  f"rank={st.r} v_bits={getattr(st, 'v_bits', '-')} "
+                  f"budget={budget} sink={cfg.sink_pages} "
                   f"window={cfg.window_pages} split={_SPLIT} "
                   f"selector_MiB={st.bytes_per_layer() * st.L / 2**20:.1f}",
                   flush=True)
@@ -254,7 +291,11 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
             self._capturing = False
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        if _NVTX:
+            _nvtx_push("amass.fa_build")
         md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if _NVTX:
+            _nvtx_pop()
         # mem variants: run the tier stage/flush/alloc lifecycle OUTSIDE the
         # graph (host), every step (staging happens during prefill AND decode).
         # Skipped on cudagraph-capture dummy batches (capture=True). Attach the
@@ -285,50 +326,111 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
             #    in the always-attended window, so it is never scored), so the
             #    whole prompt is summarized correctly here in one shot; scored
             #    pages are ALWAYS a subset of finalized pages (window >= 1).
+            need_derive = True
             if not self._capturing:
-                self._maybe_refresh(st, md, common_attn_metadata, n_req)
-            # 2. Per-step derived selection params (graph-safe, one launch); the
-            #    in-graph per-layer select kernels read these persistent buffers.
-            from ..selection import derive_page_params
-            derive_page_params(st, md.seq_lens, n_req)
+                if _NVTX:
+                    _nvtx_push("amass.refresh")
+                need_derive = self._maybe_refresh(st, md,
+                                                  common_attn_metadata, n_req)
+                if _NVTX:
+                    _nvtx_pop()
+            # 2. Per-step derived selection params (graph-safe, one launch).
+            #    All derive outputs are pure functions of ceil(seq/page)
+            #    (select.py::_derive_params_kernel), which only changes on
+            #    steps where an advanced row hits seq % page == 1 -> skip the
+            #    launch otherwise (the persistent buffers already hold the
+            #    identical values). Capture steps keep the unconditional
+            #    (dummy) derive, matching the pre-gating behaviour.
+            if need_derive:
+                from ..selection import derive_page_params
+                if _NVTX:
+                    _nvtx_push("amass.derive")
+                derive_page_params(st, md.seq_lens, n_req)
+                if _NVTX:
+                    _nvtx_pop()
         else:
             self._derive(md.seq_lens, st, self._cfg)   # bridge no-op
         md.amass = st
         return md
 
     def _maybe_refresh(self, st, md, cam, n_req):
-        """Refresh-skip gate: the 32-layer eigh/tag-scan loop is ~70% of the
-        per-step host overhead, yet the r8 codes only change when a page
-        FINALIZES or a request slot is reused. Both are detectable on the HOST
-        with no device sync via ``seq_lens_cpu``: in steady decode every request
-        advances by exactly one token (``cur == prev + 1``) and a page finalizes
-        only when ``cur // page`` increments; a reused/new slot breaks the
-        ``prev + 1`` invariant. So skip the whole refresh unless the first step,
-        a shape change, a finalization, or a slot change. Content-tag
-        invalidation inside r8_build_refresh remains the correctness backstop on
-        the steps we DO run (block reuse always coincides with a slot change)."""
+        """Refresh-skip gate. The summary codes only change when a page
+        FINALIZES or a request slot is reused; both are detectable on the HOST
+        with no device sync from the runner's CPU seq lens:
+
+          * steady step, no boundary crossed  -> NOTHING to do (skip).
+          * steady step, some rows crossed a page boundary (cur % page == 0)
+            -> ``*_build_tail`` for exactly THOSE rows: batched, sync-free
+            rebuild of each one's last finalized page (idempotent; ~55
+            launches vs the full refresh's measured ~99 ms sync-storm).
+          * anything else (first step, shape change, slot reuse, preemption)
+            -> ``*_build_bulk``: batched zero-sync rebuild of ALL finalized
+            pages of the batch (idempotent; covers slot/block reuse WITHOUT
+            the tag scan; the measured 737 ms first-decode sync-storm becomes
+            a few dozen bandwidth-bound launches).
+          * no host lens at all -> legacy per-layer tag-scan refresh.
+
+        Padded uniform-decode rows (full-cudagraph batches pad n_req up to the
+        capture size) sit at ``cur == prev == 0`` and are treated as steady;
+        they never cross a boundary so the tail skips them. (The pre-iter-2
+        gate treated padded batches as never steady, silently running the full
+        refresh EVERY step whenever ``n_req < capture size``.)
+
+        Returns ``need_derive``: whether the derive params can have changed
+        this step (ceil(seq/page) increments on ``cur % page == 1`` rows)."""
         page = self.block_size
-        sl_cpu = getattr(cam, "seq_lens_cpu", None)
-        need = True
-        if sl_cpu is not None:
-            cur = sl_cpu[:n_req]
-            prev = self._prev_seq_lens
-            if prev is not None and prev.shape == cur.shape:
-                steady = bool(torch.equal(cur, prev + 1))       # same reqs, +1 tok
-                finalized = not bool(torch.equal(cur // page, prev // page))
-                if steady and not finalized:
-                    need = False
-            self._prev_seq_lens = cur.clone()
-        else:
+        sl_cpu = _seq_lens_host(cam)
+        if sl_cpu is None:                     # no host lens -> conservative
             self._prev_seq_lens = None
-        if need:
             self._r8_refresh(st, md, n_req)
+            return True
+        cur = sl_cpu[:n_req]
+        prev = self._prev_seq_lens
+        full = True
+        crossed = None
+        if prev is not None and prev.shape == cur.shape:
+            adv = cur == prev + 1              # rows that decoded one token
+            pad = (cur == 0) & (prev == 0)     # padded uniform-decode rows
+            # frozen rows (cur == prev, e.g. vLLM end-of-generate drain steps
+            # replaying padded decodes with discarded tokens) change nothing.
+            frozen = cur == prev
+            if bool(torch.all(adv | pad | frozen)):   # steady batch
+                full = False
+                crossed = (cur % page == 0) & adv
+        if os.environ.get("AMASS_DEBUG_GATE", "0") == "1":
+            print(f"[amass gate] full={full} "
+                  f"crossed={crossed.sum().item() if crossed is not None else '-'} "
+                  f"n_req={n_req} cur={cur[:4].tolist()} "
+                  f"prev={prev[:4].tolist() if prev is not None else None}",
+                  flush=True)
+        self._prev_seq_lens = cur.clone()
+        need_derive = True
+        if full:
+            max_fin = int(cur.max().item()) // page   # CPU tensor: free
+            # First full build: zero-sync bulk (everything is stale anyway).
+            # Every later composition change (arrival, drain shuffle, slot
+            # reuse, preemption resume): batched TAG-SCAN delta -- rebuild
+            # only blocks whose content tag went stale (the measured ~800 ms
+            # bulk per transition at bs16/16K becomes ~tag-pass + new work).
+            if self._built_once:
+                self._delta_refresh(st, md, n_req, max_fin)
+            else:
+                self._bulk_refresh(st, md, n_req, max_fin)
+                self._built_once = True
+        else:
+            if bool(crossed.any()):
+                rows = torch.nonzero(crossed).squeeze(-1).to(self._device)
+                self._tail_refresh(st, md, n_req, rows)
+            # derive params change only when ceil(sl/page) does (% page == 1).
+            need_derive = bool(((cur % page == 1) & adv).any())
+        return need_derive
 
     def _r8_refresh(self, st, md, n_req):
         """Run r8_build_refresh for every layer over its resident K half.
 
         NOT graph-safe (eigh + boolean gather) -> only ever called here, on the
-        host, before graph replay. Cheap in steady state (tag compare only)."""
+        host, before graph replay. First decode step / slot changes only; the
+        steady-state finalize path is ``_tail_refresh``."""
         if getattr(self._cfg, "score", "r8") == "quad":
             from ..selection import quad_build_refresh as _refresh
         else:
@@ -338,3 +440,30 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
         for lidx, kvc in enumerate(self._layer_kv):
             K, _ = _split_kv(kvc)          # (NB, page, n_kv, d) resident K half
             _refresh(st, lidx, K, bt, sl, n_req)
+
+    def _tail_refresh(self, st, md, n_req, rows):
+        """Steady-state finalize step: batched all-layer sync-free rebuild of
+        the crossing rows' last finalized page (selection.build.r8_build_tail)."""
+        if getattr(self._cfg, "score", "r8") == "quad":
+            from ..selection import quad_build_tail as _tail
+        else:
+            from ..selection import r8_build_tail as _tail
+        _tail(st, self._layer_k, md.block_table, md.seq_lens, n_req, rows)
+
+    def _bulk_refresh(self, st, md, n_req, max_fin):
+        """First decode step / slot change: batched zero-sync rebuild of ALL
+        finalized pages, all layers (selection.build.r8_build_bulk)."""
+        if getattr(self._cfg, "score", "r8") == "quad":
+            from ..selection import quad_build_bulk as _bulk
+        else:
+            from ..selection import r8_build_bulk as _bulk
+        _bulk(st, self._layer_k, md.block_table, md.seq_lens, n_req, max_fin)
+
+    def _delta_refresh(self, st, md, n_req, max_fin):
+        """Batch-composition change: batched all-layer tag scan, rebuild only
+        stale blocks (selection.build.r8_build_delta)."""
+        if getattr(self._cfg, "score", "r8") == "quad":
+            from ..selection import quad_build_delta as _delta
+        else:
+            from ..selection import r8_build_delta as _delta
+        _delta(st, self._layer_k, md.block_table, md.seq_lens, n_req, max_fin)
