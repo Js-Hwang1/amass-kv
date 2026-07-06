@@ -162,12 +162,14 @@ quad_score_kernel(
     const int*     __restrict__ bt,          // (n_req, bt_stride)
     const int*     __restrict__ nsh,         // (R,)
     float*         __restrict__ score,       // (R,n_kv,MP)
+    float*         __restrict__ score_h,     // (R,n_kv,G,MP)  (nrm combine)
     const float scale, const int n_kv, const int G,
     const long q_st, const long q_hs,
     const long mu_sb, const long mu_ks, const long mus_sb,
     const long v_sb,  const long v_ks,  const long vs_sb, const long sg_sb,
     const int bt_stride,
-    const long sc_sr, const long sc_sh, const int MP)
+    const long sc_sr, const long sc_sh, const int MP,
+    const long sh_sr, const long sh_sh, const long sh_sg, const int write_h)
 {
     const int req  = blockIdx.x;
     const int kh   = blockIdx.y;
@@ -285,12 +287,19 @@ quad_score_kernel(
         float qmu = qm * scale * musf;
         float S = (gl < G) ? (qmu + quad) : -CUDART_INF_F;
 
-        // ---- kv-union group max over the 8 groups (lane bits 4,8,16) ------ //
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
-        if (lane == 0)
-            score[(long)req * sc_sr + (long)kh * sc_sh + p] = S;
+        if (write_h) {
+            // nrm combine: emit the per-head score S[g] (one sublane owns it).
+            if (sub == 0 && gl < G)
+                score_h[(long)req * sh_sr + (long)kh * sh_sh
+                        + (long)gl * sh_sg + p] = S;
+        } else {
+            // ---- kv-union group max over the 8 groups (lane bits 4,8,16) -- //
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
+            if (lane == 0)
+                score[(long)req * sc_sr + (long)kh * sc_sh + p] = S;
+        }
     }
 }
 
@@ -298,8 +307,9 @@ void quad_score_launch(
     torch::Tensor q, torch::Tensor mu, torch::Tensor mus,
     torch::Tensor vv, torch::Tensor vvs, torch::Tensor sig2,
     torch::Tensor bt, torch::Tensor nsh, torch::Tensor score,
+    torch::Tensor score_h,
     double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t MP,
-    int64_t zsplit)
+    int64_t zsplit, int64_t write_h)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
@@ -313,13 +323,16 @@ void quad_score_launch(
         reinterpret_cast<const __half*>(sig2.data_ptr()),
         bt.data_ptr<int>(), nsh.data_ptr<int>(),
         score.data_ptr<float>(),
+        score_h.data_ptr<float>(),
         (float)scale, (int)n_kv, (int)G,
         (long)q.stride(0), (long)q.stride(1),
         (long)mu.stride(0), (long)mu.stride(1), (long)mus.stride(0),
         (long)vv.stride(0), (long)vv.stride(1), (long)vvs.stride(0),
         (long)sig2.stride(0),
         (int)bt.stride(0),
-        (long)score.stride(0), (long)score.stride(1), (int)MP);
+        (long)score.stride(0), (long)score.stride(1), (int)MP,
+        (long)score_h.stride(0), (long)score_h.stride(1),
+        (long)score_h.stride(2), (int)write_h);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -404,12 +417,14 @@ qi8_score_kernel(
     const int*     __restrict__ bt,          // (n_req, bt_stride)
     const int*     __restrict__ nsh,         // (R,)
     float*         __restrict__ score,       // (R,n_kv,MP)
+    float*         __restrict__ score_h,     // (R,n_kv,G,MP)  (nrm combine)
     const float scale, const int n_kv, const int G,
     const long q_st, const long q_hs,
     const long mu_sb, const long mu_ks, const long mus_sb,
     const long v_sb,  const long v_ks,  const long vs_sb, const long sg_sb,
     const int bt_stride,
-    const long sc_sr, const long sc_sh, const int MP)
+    const long sc_sr, const long sc_sh, const int MP,
+    const long sh_sr, const long sh_sh, const long sh_sg, const int write_h)
 {
     const int req  = blockIdx.x;
     const int kh   = blockIdx.y;
@@ -601,14 +616,24 @@ qi8_score_kernel(
             const float qh1 = (float)comb1 * qs * vs.y;
             S = qmu + qcoef * (sg.x * qh0 * qh0 + sg.y * qh1 * qh1);
         }
-        // kv-union group max over gid (lane bits 4,8,16), t4 preserved
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
-        S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
-        if (lane == 0)
-            score[(long)req * sc_sr + (long)kh * sc_sh + p0] = S;
-        if (lane == 2 && p1 < nselhi)
-            score[(long)req * sc_sr + (long)kh * sc_sh + p1] = S;
+        if (write_h) {
+            // nrm combine: the t4==0 lane owns S[gid,p0], t4==2 owns S[gid,p1].
+            if (t4 == 0 && gid < G)
+                score_h[(long)req * sh_sr + (long)kh * sh_sh
+                        + (long)gid * sh_sg + p0] = S;
+            if (t4 == 2 && gid < G && p1 < nselhi)
+                score_h[(long)req * sh_sr + (long)kh * sh_sh
+                        + (long)gid * sh_sg + p1] = S;
+        } else {
+            // kv-union group max over gid (lane bits 4,8,16), t4 preserved
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
+            S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
+            if (lane == 0)
+                score[(long)req * sc_sr + (long)kh * sc_sh + p0] = S;
+            if (lane == 2 && p1 < nselhi)
+                score[(long)req * sc_sr + (long)kh * sc_sh + p1] = S;
+        }
     }
 }
 
@@ -616,8 +641,9 @@ void qi8_score_launch(
     torch::Tensor q, torch::Tensor mu, torch::Tensor mus,
     torch::Tensor vv, torch::Tensor vvs, torch::Tensor sig2,
     torch::Tensor bt, torch::Tensor nsh, torch::Tensor score,
+    torch::Tensor score_h,
     double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t MP,
-    int64_t zsplit)
+    int64_t zsplit, int64_t write_h)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
@@ -636,13 +662,16 @@ void qi8_score_launch(
         reinterpret_cast<const __half*>(sig2.data_ptr()),
         bt.data_ptr<int>(), nsh.data_ptr<int>(),
         score.data_ptr<float>(),
+        score_h.data_ptr<float>(),
         (float)scale, (int)n_kv, (int)G,
         (long)q.stride(0), (long)q.stride(1),
         (long)mu.stride(0), (long)mu.stride(1), (long)mus.stride(0),
         (long)vv.stride(0), (long)vv.stride(1), (long)vvs.stride(0),
         (long)sig2.stride(0),
         (int)bt.stride(0),
-        (long)score.stride(0), (long)score.stride(1), (int)MP);
+        (long)score.stride(0), (long)score.stride(1), (int)MP,
+        (long)score_h.stride(0), (long)score_h.stride(1),
+        (long)score_h.stride(2), (int)write_h);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -784,12 +813,14 @@ qi8w_score_kernel(
     const int*     __restrict__ bt,          // (n_req, bt_stride)
     const int*     __restrict__ nsh,         // (R,)
     float*         __restrict__ score,       // (R,n_kv,MP)
+    float*         __restrict__ score_h,     // (R,n_kv,G,MP)  (nrm combine)
     const float scale, const int n_kv, const int G,
     const long q_st, const long q_hs,
     const long mu_sb, const long mus_sb, const long v_sb,
     const long vs_sb, const long sg_sb,
     const int bt_stride,
-    const long sc_sr, const long sc_sh, const int MP)
+    const long sc_sr, const long sc_sh, const int MP,
+    const long sh_sr, const long sh_sh, const long sh_sg, const int write_h)
 {
     const int req  = blockIdx.x;
     const int kh0  = blockIdx.y * QI8W_KH;     // first kv-head of this CTA
@@ -1009,13 +1040,23 @@ qi8w_score_kernel(
 #endif
                 S = qmu + qcoef * (sg.x * qh0 * qh0 + sg.y * qh1 * qh1);
             }
-            S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
-            S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
-            S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
-            if (lane == 0)
-                score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p0] = S;
-            if (lane == 2 && p1 < nselhi)
-                score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p1] = S;
+            if (write_h) {
+                // nrm combine: t4==0 lane owns S[gid,p0], t4==2 owns S[gid,p1].
+                if (t4 == 0 && gid < G)
+                    score_h[(long)req * sh_sr + (long)(kh0 + kh) * sh_sh
+                            + (long)gid * sh_sg + p0] = S;
+                if (t4 == 2 && gid < G && p1 < nselhi)
+                    score_h[(long)req * sh_sr + (long)(kh0 + kh) * sh_sh
+                            + (long)gid * sh_sg + p1] = S;
+            } else {
+                S = fmaxf(S, __shfl_xor_sync(~0u, S, 4));
+                S = fmaxf(S, __shfl_xor_sync(~0u, S, 8));
+                S = fmaxf(S, __shfl_xor_sync(~0u, S, 16));
+                if (lane == 0)
+                    score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p0] = S;
+                if (lane == 2 && p1 < nselhi)
+                    score[(long)req * sc_sr + (long)(kh0 + kh) * sc_sh + p1] = S;
+            }
         }
     }
     // PDL: release dependents (e.g. topb launched with the programmatic-
@@ -1029,8 +1070,9 @@ void qi8w_score_launch(
     torch::Tensor q, torch::Tensor mu, torch::Tensor mus,
     torch::Tensor vv, torch::Tensor vvs, torch::Tensor sig2,
     torch::Tensor bt, torch::Tensor nsh, torch::Tensor score,
+    torch::Tensor score_h,
     double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t MP,
-    int64_t zsplit)
+    int64_t zsplit, int64_t write_h)
 {
     TORCH_CHECK(n_kv % QI8W_KH == 0, "qi8w: n_kv must be a multiple of KH");
     TORCH_CHECK(G <= 8, "qi8w: G must be <= 8");
@@ -1059,12 +1101,15 @@ void qi8w_score_launch(
         reinterpret_cast<const __half*>(sig2.data_ptr()),
         bt.data_ptr<int>(), nsh.data_ptr<int>(),
         score.data_ptr<float>(),
+        score_h.data_ptr<float>(),
         (float)scale, (int)n_kv, (int)G,
         (long)q.stride(0), (long)q.stride(1),
         (long)mu.stride(0), (long)mus.stride(0), (long)vv.stride(0),
         (long)vvs.stride(0), (long)sig2.stride(0),
         (int)bt.stride(0),
-        (long)score.stride(0), (long)score.stride(1), (int)MP);
+        (long)score.stride(0), (long)score.stride(1), (int)MP,
+        (long)score_h.stride(0), (long)score_h.stride(1),
+        (long)score_h.stride(2), (int)write_h);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1172,6 +1217,15 @@ def _get_i8(v_bits: int = 8):
     return mod
 
 
+def _nrm_from_cuda(st, n_req: int) -> None:
+    """Reduce the per-head scores the CUDA kernel wrote into ``st.score_h`` into
+    ``st.score`` via the shared Triton nrm passes (per-head page-max, then
+    sum_g exp(S[g] - hmax[g])).  Same math as the Triton quad reference's nrm
+    combine, so CUDA vs Triton stay bitwise-matched at the selection level."""
+    from .quad_score import _nrm_launch
+    _nrm_launch(st, n_req)
+
+
 def _quad_layer_state(st, layer: int):
     """Per-layer (mu, mu_scale, V, V_scale, sig2) quad views.  Accepts either a
     QuadState (``quad_mu``/``quad_V``/``quad_sig2`` slabs) or an object exposing
@@ -1196,6 +1250,14 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
     # rank r': prefer explicit ``rp``/``r`` attrs (QuadState); int8 V last dim == r'.
     rp = int(getattr(st, "rp", None) or getattr(st, "r", V.shape[-1]))
     impl = os.environ.get("QUAD_CUDA_IMPL", "i8w")
+    # GQA combine.  combine="nrm" (default): the kernel writes the per-head score
+    # into st.score_h, then the shared Triton nrm passes reduce it into st.score
+    # (bitwise-identical combine to the Triton quad reference).  combine="max":
+    # the kernel group-maxes in-warp and writes st.score directly (score_h unused,
+    # a dummy pointer + write_h=0).
+    nrm = getattr(st, "combine", "max") == "nrm"
+    score_h = st.score_h if nrm else st.score
+    write_h = 1 if nrm else 0
     if rp == 2 and impl != "f32":
         # V last dim: r' (int8) or r'/2 (int4 packed nibbles along r')
         v_bits = 8 if V.shape[-1] == rp else 4
@@ -1214,18 +1276,24 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
             mod = _get_i8w(v_bits=v_bits)
             mod.qi8w_score_launch(
                 q, mu, mu_s, V, V_s, sig2,
-                block_table, st.n_sel_hi, st.score,
+                block_table, st.n_sel_hi, st.score, score_h,
                 float(scale), int(n_req), n_kv, G,
                 int(st.max_pages),
-                int(_zsplit_i8w(int(n_req), n_kv, int(st.max_pages))))
+                int(_zsplit_i8w(int(n_req), n_kv, int(st.max_pages))),
+                int(write_h))
+            if nrm:
+                _nrm_from_cuda(st, int(n_req))
             return
         mod = _get_i8(v_bits)
         mod.qi8_score_launch(
             q, mu, mu_s, V, V_s, sig2,
-            block_table, st.n_sel_hi, st.score,
+            block_table, st.n_sel_hi, st.score, score_h,
             float(scale), int(n_req), int(st.n_kv), int(st.G),
             int(st.max_pages),
-            int(_zsplit_i8(int(n_req), int(st.n_kv), int(st.max_pages))))
+            int(_zsplit_i8(int(n_req), int(st.n_kv), int(st.max_pages))),
+            int(write_h))
+        if nrm:
+            _nrm_from_cuda(st, int(n_req))
         return
     assert V.shape[-1] == rp, (
         "the f32 quad_score_cuda supports int8 V only (V last dim must == r'); "
@@ -1233,6 +1301,8 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
     mod = _get(rp)
     mod.quad_score_launch(
         q, mu, mu_s, V, V_s, sig2,
-        block_table, st.n_sel_hi, st.score,
+        block_table, st.n_sel_hi, st.score, score_h,
         float(scale), int(n_req), int(st.n_kv), int(st.G), int(st.max_pages),
-        int(_zsplit(int(n_req), int(st.n_kv))))
+        int(_zsplit(int(n_req), int(st.n_kv))), int(write_h))
+    if nrm:
+        _nrm_from_cuda(st, int(n_req))

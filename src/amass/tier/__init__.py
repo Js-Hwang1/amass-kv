@@ -21,10 +21,11 @@ Modules:
   tier.py        Tier facade + TierVSource (the V_SRC==1 Stage-B seam)
 
 Public surface (imported lazily; torch/CUDA only touched at construction):
-  Tier, TierVSource, MappedHostVPool, Residency, Staging
+  Tier, TierVSource, MappedHostVPool, Residency, Staging, mem_dynamic_decode
 """
 from __future__ import annotations
 
+from .decode_mem import mem_dynamic_decode  # noqa: F401
 from .pool import MappedHostVPool  # noqa: F401
 from .residency import Residency  # noqa: F401
 from .staging import Staging  # noqa: F401
@@ -36,4 +37,5 @@ __all__ = [
     "MappedHostVPool",
     "Residency",
     "Staging",
+    "mem_dynamic_decode",
 ]

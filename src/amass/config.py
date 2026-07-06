@@ -34,6 +34,11 @@ class AmassConfig:
     # Alternative to coverage: a fixed per-step selected-page FRACTION (1-cr).
     # When set, overrides `coverage`.
     budget: Optional[float] = None
+    # Budget ALLOCATION across the (layer, kv-head) units: every unit gets
+    # exactly b = ceil(budget * n_selectable) pages (the per-unit top-b radix of
+    # select.py). This STATIC allocation is the only budget path. (A conserved-
+    # total "dynamic" per-unit budget was measured to give ~0 task headroom over
+    # static -- kept as a paper negative, code removed; see task #44.)
     table: Table = "kv-union"
     sink_pages: int = 1
     window_pages: int = 1
@@ -41,17 +46,41 @@ class AmassConfig:
     # Required for mem-kv (K is not resident); optional for the others.
     r8_screen: bool = False
     r8_rank: int = 8
-    # Selection SUMMARY / score mode.  "quad" (default, LongBench-CERTIFIED) =
-    # the Gaussian-MGF quadratic page score (ours_doc/QUAD_SUMMARY_METHOD.md):
-    # drops the per-key coords c, stores r' eigenvalues instead, and shrinks the
-    # resident selector 3.28x (15.6% -> 4.7% of the KV; measured 1201 vs 3943 MiB)
-    # while beating r8 on LongBench-v1 (quad@5% -0.22 vs r8@5% -0.38 vs FullKV),
-    # with a cheaper tail-free hot-path kernel.  "r8" = the backward-safe fallback
-    # (per-key low-rank logsumexp page-mass estimate mu/Vk/c, rank r8_rank).
-    score: Literal["r8", "quad"] = "quad"
+    # Selection SUMMARY / score mode.
+    #   "quad" (DEFAULT, fast CUDA, LongBench-CERTIFIED) = the Gaussian-MGF
+    #     quadratic page score (ours_doc/QUAD_SUMMARY_METHOD.md): drops the
+    #     per-key coords c, stores r' eigenvalues instead, and shrinks the
+    #     resident selector 3.28x (15.6% -> ~3.4% int4-V of the KV) while beating
+    #     r8 on LongBench-v1, with a cheaper tail-free hot-path kernel that runs
+    #     on the hand-CUDA Hopper tensor-core kernel.
+    #   "clse" (opt-in, reasoning-optimized) = quad's storage geometry PLUS
+    #     rank-r' per-key coords (int4, ~18 B/page) + a residual scalar, scored
+    #     with the r'-projected logsumexp + isotropic residual.  This recovers
+    #     the peaky single-key mass the Gaussian drop-c "quad" form misses
+    #     (reasoning recall .68 -> .80; see ours_doc CLSE signal note).  For now
+    #     CLSE runs on the graph-safe Triton reference path; a hand-CUDA CLSE
+    #     kernel is a FOLLOW-UP, so the fast production default stays "quad".
+    #   "r8" = the backward-safe fallback (per-key low-rank logsumexp page-mass
+    #     estimate mu/Vk/c, rank r8_rank).
+    score: Literal["r8", "quad", "clse"] = "quad"
     quad_rank: int = 2             # quad rank r' (default 2; rank-insensitive)
-    # quad V-summary quant bits: 8=int8 (~4.7%), 4=int4 (~3.4% prod default)
-    v_bits: int = 8
+    # quad V-summary quant bits (production default = int4).  int4-V = ~3.4%
+    # resident selector (vs int8's 4.7%): a free memory reduction, RULER
+    # task-equivalent + proxy-lossless per the quant study, neutral speed on the
+    # i8w kernel per DEEP-OPT.  int8 stays available via AMASS_CONFIG
+    # {"quad_v_bits": 8}.
+    quad_v_bits: int = 4
+    # GQA combine over the group's per-head page scores S[g] (quad AND clse):
+    #   "nrm" (DEFAULT) = per-head-normalized mass sum, sum_g exp(S[g] - max_page
+    #     S[g]).  The confirmed win (+5.8pt AIME, LongBench-safe; tasks #42/#47/
+    #     #48): group-max was the WORST combine.  Graph-safe (fixed extra passes).
+    #   "max" = the plain GQA group max (kept reachable for ablation).
+    quad_combine: Literal["max", "nrm"] = "nrm"
+    # CLSE (score="clse") coord quantization.  quad_c_bits: 4 (default) | 8;
+    # quad_c_grain: "token" (per-key scale, default) | "page" (one scale/page).
+    # Ignored unless score == "clse".
+    quad_c_bits: int = 4
+    quad_c_grain: Literal["token", "page"] = "token"
 
     # ---- Stage B / tier (mem variants only) ------------------------------ #
     hot_slots: int = 2048          # hot-buffer slots per (layer, kv-head)
@@ -86,12 +115,24 @@ class AmassConfig:
             raise ValueError(f"coverage must be in (0,1], got {self.coverage}")
         if self.budget is not None and not (0.0 < self.budget <= 1.0):
             raise ValueError(f"budget must be in (0,1], got {self.budget}")
-        if self.score not in ("r8", "quad"):
-            raise ValueError(f"score must be 'r8' or 'quad', got {self.score!r}")
+        if self.score not in ("r8", "quad", "clse"):
+            raise ValueError(
+                f"score must be 'r8', 'quad' or 'clse', got {self.score!r}")
         if self.quad_rank < 1:
             raise ValueError(f"quad_rank must be >= 1, got {self.quad_rank}")
-        if self.v_bits not in (4, 8):
-            raise ValueError(f"v_bits must be 4 or 8, got {self.v_bits}")
+        if self.quad_v_bits not in (4, 8):
+            raise ValueError(
+                f"quad_v_bits must be 4 or 8, got {self.quad_v_bits}")
+        if self.quad_combine not in ("max", "nrm"):
+            raise ValueError(
+                f"quad_combine must be 'max' or 'nrm', got {self.quad_combine!r}")
+        if self.quad_c_bits not in (4, 8):
+            raise ValueError(
+                f"quad_c_bits must be 4 or 8, got {self.quad_c_bits}")
+        if self.quad_c_grain not in ("token", "page"):
+            raise ValueError(
+                f"quad_c_grain must be 'token' or 'page', got "
+                f"{self.quad_c_grain!r}")
 
     # ---- construction ---------------------------------------------------- #
     @classmethod

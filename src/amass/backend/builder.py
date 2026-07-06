@@ -172,10 +172,11 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
 
         try:
             cfg = self._cfg
-            # Score mode selects the summary state: r8 (default fallback) or the
-            # 3.4x-smaller quad (Gaussian-MGF quadratic) selector. Both mirror
-            # the same alloc-once / graph-safe layout, so the rest is identical.
-            quad = getattr(cfg, "score", "r8") == "quad"
+            # Score mode selects the summary state: r8 (backward-safe fallback)
+            # or the 3.4x-smaller QuadState selector (score="quad", default, or
+            # "clse", the coords-augmented reasoning signal). Both mirror the
+            # same alloc-once / graph-safe layout, so the rest is identical.
+            quad = getattr(cfg, "score", "r8") in ("quad", "clse")
             if quad:
                 from ..selection import QuadState as _State
                 rank = cfg.quad_rank
@@ -191,9 +192,16 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
             # STATIC selection is budget-driven; if only a coverage was given,
             # fall back to a fixed fraction (no adaptive per-head b).
             budget = cfg.budget if cfg.budget is not None else 0.1
-            # quad V-summary quant bits (int8 default / int4 prod); R8State does
-            # NOT take v_bits, so only thread it through the quad branch.
-            extra_state = {"v_bits": getattr(cfg, "v_bits", 8)} if quad else {}
+            # quad V-summary quant bits (int4 prod default / int8 opt-in) + the
+            # GQA combine (nrm default) + the clse coords.  R8State takes none of
+            # these, so only thread them through the quad branch.
+            extra_state = {}
+            if quad:
+                extra_state["v_bits"] = cfg.quad_v_bits
+                extra_state["combine"] = cfg.quad_combine
+                if getattr(cfg, "score", "quad") == "clse":
+                    extra_state.update(coords="lse", c_bits=cfg.quad_c_bits,
+                                       c_grain=cfg.quad_c_grain)
             st = _State(
                 self._device, num_layers=len(self._layer_names),
                 num_blocks=int(nb), n_kv=n_kv, G=G, head_dim=self.headdim,
@@ -218,6 +226,8 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
                   f"{st.L} num_blocks={st.NB} reqs={max_reqs} n_kv={n_kv} G={G} "
                   f"d={self.headdim} page={page} max_pages={max_pages} "
                   f"rank={st.r} v_bits={getattr(st, 'v_bits', '-')} "
+                  f"combine={getattr(st, 'combine', '-')} "
+                  f"coords={getattr(st, 'coords', '-')} "
                   f"budget={budget} sink={cfg.sink_pages} "
                   f"window={cfg.window_pages} split={_SPLIT} "
                   f"selector_MiB={st.bytes_per_layer() * st.L / 2**20:.1f}",
@@ -431,7 +441,7 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
         NOT graph-safe (eigh + boolean gather) -> only ever called here, on the
         host, before graph replay. First decode step / slot changes only; the
         steady-state finalize path is ``_tail_refresh``."""
-        if getattr(self._cfg, "score", "r8") == "quad":
+        if getattr(self._cfg, "score", "r8") in ("quad", "clse"):
             from ..selection import quad_build_refresh as _refresh
         else:
             from ..selection import r8_build_refresh as _refresh
@@ -444,7 +454,7 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
     def _tail_refresh(self, st, md, n_req, rows):
         """Steady-state finalize step: batched all-layer sync-free rebuild of
         the crossing rows' last finalized page (selection.build.r8_build_tail)."""
-        if getattr(self._cfg, "score", "r8") == "quad":
+        if getattr(self._cfg, "score", "r8") in ("quad", "clse"):
             from ..selection import quad_build_tail as _tail
         else:
             from ..selection import r8_build_tail as _tail
@@ -453,7 +463,7 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
     def _bulk_refresh(self, st, md, n_req, max_fin):
         """First decode step / slot change: batched zero-sync rebuild of ALL
         finalized pages, all layers (selection.build.r8_build_bulk)."""
-        if getattr(self._cfg, "score", "r8") == "quad":
+        if getattr(self._cfg, "score", "r8") in ("quad", "clse"):
             from ..selection import quad_build_bulk as _bulk
         else:
             from ..selection import r8_build_bulk as _bulk
@@ -462,7 +472,7 @@ class AmassMetadataBuilder(FlashAttentionMetadataBuilder):
     def _delta_refresh(self, st, md, n_req, max_fin):
         """Batch-composition change: batched all-layer tag scan, rebuild only
         stale blocks (selection.build.r8_build_delta)."""
-        if getattr(self._cfg, "score", "r8") == "quad":
+        if getattr(self._cfg, "score", "r8") in ("quad", "clse"):
             from ..selection import quad_build_delta as _delta
         else:
             from ..selection import r8_build_delta as _delta

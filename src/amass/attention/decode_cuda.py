@@ -28,6 +28,19 @@ Both paths are bitwise-close to the Triton golden (max|Δ| <= 2.5e-4) and to fp3
 dense (all-pages / restricted top-b); both CUDA-graph capture/replay (alloc-free,
 host-sync-free -- verified).
 
+VARIABLE per-unit page counts: every path here is DATA-DEPENDENT on
+``st.page_cnt[r, kh]`` -- the split kernel derives
+``pps = max(cdiv(cnt, split), pps_min)`` and its loop bounds per (req, kv-head),
+the fused kernel walks ``nwaves = cdiv(cnt, NPG)``, and the merge recomputes the
+active-split count from the same ``cnt`` -- with a FIXED allocation (page_table
+rows are MP wide, the per-unit cap). So a selection where counts vary
+per (req, kv-head), from 0 selectable pages up to all of them, is correct and
+CUDA-graph safe with NO kernel change (loop bounds are device-side values; the
+launch shapes never change). Gated by the skewed-count kernel test. Work across
+CTAs becomes count-imbalanced under skew, but the total pages read is conserved
+(= the matched total budget), so throughput at occupancy is unchanged; split-K
+already subdivides any oversized unit into ~pps-page chunks.
+
 Kernel math == the Triton golden reference (online-softmax flash decode over the
 Stage-A-selected pages):
   * K always resident (engine K half), read from the paged cache by physical

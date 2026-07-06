@@ -30,8 +30,25 @@ import os
 import torch
 
 from .build import (_build_blocks, _bulk_blocks, _delta_select, _eigh_jacobi,
-                    _page_eigh, _quant_mu, _quant_vk, _scatter_index,
+                    _page_eigh, _quant_c, _quant_mu, _quant_vk, _scatter_index,
                     _tail_blocks)
+
+
+def _clse_extras(st, mu, S2r, U8, S8, Kp_flat=None, trace=None):
+    """CLSE coords + residual energy from the eigh factors.  c = U8 * S8
+    exactly (dc @ Vk = U8 S8, U orthonormal over the page dim).  trace of the
+    centered scatter = sum ||k||^2 - P ||mu||^2 (cheap, avoids re-centering);
+    resid = trace - sum(top-r' eigenvalues) >= 0."""
+    c = U8 * S8[..., None, :]                              # (..., page, r')
+    grain = "page" if st.c_grain == "token" else "tensor"
+    c_code, c_s = _quant_c(c, grain, st.c_bits)
+    if trace is None:
+        trace = (Kp_flat.float().pow(2).sum(dim=(1, 3))
+                 - st.page * mu.pow(2).sum(-1))            # (N, n_kv)
+    resid = (trace - S2r.sum(-1)).clamp_min(0)
+    if st.c_grain == "page":
+        c_s = c_s[..., 0]                                  # one scale/(blk,head)
+    return c_code, c_s, resid
 from .quad_state import QuadState
 
 
@@ -51,6 +68,12 @@ def _quad_write(st: QuadState, Kp_flat: torch.Tensor, lidx: torch.Tensor,
     st.V_scale[lidx, bidx] = Vk_s
     st.quad_sig2[lidx, bidx] = S2r.to(st.quad_sig2.dtype)
     st.quad_tag[lidx, bidx] = tag_new.to(st.quad_tag.dtype)
+    if st.coords == "lse":
+        c_code, c_s, resid = _clse_extras(st, mu, S2r, _U8, _S8,
+                                          Kp_flat=Kp_flat)
+        st.quad_c[lidx, bidx] = c_code
+        st.c_scale[lidx, bidx] = c_s.to(st.c_scale.dtype)
+        st.quad_resid[lidx, bidx] = resid.to(st.quad_resid.dtype)
 
 
 def quad_build_tail(st: QuadState, K_layers, block_table: torch.Tensor,
@@ -166,4 +189,10 @@ def quad_build_refresh(st: QuadState, layer: int, K: torch.Tensor,
     st.V_scale[layer, sb] = Vk_s
     st.quad_sig2[layer, sb] = S2r.to(st.quad_sig2.dtype)
     st.quad_tag[layer, sb] = K[sb, page - 1, :, :tagw].to(st.quad_tag.dtype)
+    if st.coords == "lse":
+        c_code, c_s, resid = _clse_extras(st, mu, S2r, U8, S8,
+                                          trace=S2.sum(-1))
+        st.quad_c[layer, sb] = c_code
+        st.c_scale[layer, sb] = c_s.to(st.c_scale.dtype)
+        st.quad_resid[layer, sb] = resid.to(st.quad_resid.dtype)
     return int(sb.numel())

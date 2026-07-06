@@ -92,21 +92,21 @@ def r8_selection_available() -> bool:
 
 
 def quad_selection_available() -> bool:
-    """True when amass.selection exposes the full quad Stage-A surface."""
+    """True when amass.selection exposes the full quad + clse Stage-A surface."""
     try:
         from .. import selection as sel
     except Exception:
         return False
     return all(getattr(sel, n, None) is not None for n in
                ("QuadState", "derive_page_params", "select_pages_quad",
-                "quad_build_refresh"))
+                "quad_build_refresh", "clse_score", "select_pages_clse"))
 
 
 def use_quad() -> bool:
-    """The active config selects the quad score mode (opt-in via AMASS_CONFIG
-    {"score":"quad"}); r8 stays the default fallback."""
+    """The active config selects a QuadState-backed score mode (``quad``,
+    default, or ``clse``); r8 stays the backward-safe fallback."""
     cfg = _config
-    return cfg is not None and getattr(cfg, "score", "r8") == "quad"
+    return cfg is not None and getattr(cfg, "score", "r8") in ("quad", "clse")
 
 
 def _force_bridge() -> bool:
@@ -181,29 +181,53 @@ def _r8_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
 
 def _quad_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
                          cfg) -> None:
-    """Bridge-signature Stage-A entry for the quad score mode.
+    """Bridge-signature Stage-A entry for the quad / clse score modes.
 
     Dispatches the quadratic score to the hand-CUDA Hopper kernel (``quad_score_
-    cuda``, the sibling QUAD-CUDA agent's file, bitwise target = the Triton
-    reference) when ``cfg.use_cuda`` and it builds; else the Triton
-    ``quad_score``.  The top-b radix tau-select is quad-agnostic, so it reuses
-    the SAME CUDA/Triton selector as the r8 path.  ``derive=False``: the builder
-    derived the per-step page params already."""
+    cuda``, bitwise target = the Triton reference, nrm combine folded in) when
+    ``cfg.use_cuda`` and it builds; else the Triton ``quad_score``.  The top-b
+    radix tau-select is score-agnostic, so it reuses the SAME CUDA/Triton
+    selector as the r8 path.  ``derive=False``: the builder derived the per-step
+    page params already.
+
+    score="clse" (``st.coords == "lse"``) has no hand-CUDA kernel yet, so it
+    always runs the graph-safe Triton ``clse_score`` reference + the stock
+    (CUDA or Triton) top-b selector."""
     from .. import selection as sel
 
     lidx = _layer_index(st, kv_cache)
+
+    def _topb():
+        if os.environ.get("AMASS_TOPB_TRITON", "0") == "1":
+            from ..selection.select import topb_select
+            topb_select(st, n_req)
+        else:
+            from ..selection import select_cuda
+            select_cuda.topb_select_cuda(st, n_req)
+
+    # CLSE: Triton reference score (graph-safe) + top-b.  The nrm combine is
+    # applied inside ``clse_score`` when ``st.combine == "nrm"``.
+    if getattr(st, "coords", "none") == "lse":
+        sel.clse_score(st, lidx, q, block_table, seq_lens, n_req, scale)
+        if cfg.use_cuda:
+            try:
+                _topb()
+                return
+            except Exception:  # noqa: BLE001
+                from ..selection.select import topb_select
+                topb_select(st, n_req)
+                return
+        from ..selection.select import topb_select
+        topb_select(st, n_req)
+        return
+
     global _QSEL_CUDA
     if cfg.use_cuda and _QSEL_CUDA is not False:
         try:
             from ..selection import quad_score_cuda
             quad_score_cuda.quad_score_cuda(st, lidx, q, block_table, seq_lens,
                                             n_req, scale)
-            if os.environ.get("AMASS_TOPB_TRITON", "0") == "1":
-                from ..selection.select import topb_select
-                topb_select(st, n_req)
-            else:
-                from ..selection import select_cuda
-                select_cuda.topb_select_cuda(st, n_req)
+            _topb()
             if _QSEL_CUDA is None:
                 _QSEL_CUDA = True
                 print("[amass] selection kernels: CUDA quad_score + CUDA radix "

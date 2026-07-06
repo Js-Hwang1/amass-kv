@@ -47,7 +47,9 @@ class QuadState:
                  rank: int = 2, budget: float = 0.1,
                  sink_pages: int = 1, window_pages: int = 1,
                  tagw: int = TAGW,
-                 v_grain: str = "col", v_bits: int = 8, mu_bits: int = 8):
+                 v_grain: str = "col", v_bits: int = 8, mu_bits: int = 8,
+                 coords: str = "none", c_bits: int = 4,
+                 c_grain: str = "token", combine: str = "max"):
         assert window_pages >= 1, "window_pages>=1: the partial tail must live " \
             "inside the always-attended window so the selectable region is exact"
         assert v_grain in ("col", "tensor")
@@ -57,6 +59,12 @@ class QuadState:
         assert rank >= 1
         if v_bits == 4:
             assert rank % 2 == 0, "int4 V packs 2 nibbles/byte along r' -> r' even"
+        # ---- CLSE extension: per-key rank-r' coords + GQA combine --------- #
+        assert coords in ("none", "lse")
+        assert c_bits in (4, 8) and c_grain in ("token", "page")
+        assert combine in ("max", "nrm")
+        if coords == "lse" and c_bits == 4:
+            assert rank % 2 == 0, "int4 coords pack 2 nibbles/byte along r'"
         L, NB, D, r, MP, R = num_layers, num_blocks, head_dim, rank, max_pages, \
             max_reqs
         self.L, self.NB, self.n_kv, self.G, self.d = L, NB, n_kv, G, D
@@ -66,6 +74,8 @@ class QuadState:
         self.sink_pages, self.window_pages = int(sink_pages), int(window_pages)
         self.v_grain = v_grain
         self.v_bits, self.mu_bits = int(v_bits), 8
+        self.coords, self.c_bits, self.c_grain = coords, int(c_bits), c_grain
+        self.combine = combine
         self.device = device
         i8, f16, bf16 = torch.int8, torch.float16, torch.bfloat16
         i32, f32, f64 = torch.int32, torch.float32, torch.float64
@@ -82,11 +92,40 @@ class QuadState:
         self.quad_tag = torch.full((L, NB, n_kv, tagw), float("nan"),
                                    device=device, dtype=bf16)
 
+        # ---- CLSE state: quantized per-key coords + residual energy ------- #
+        # Only allocated for score="clse" (coords="lse"); the fast "quad" path
+        # leaves these None.  c = U8*S8 (int4/int8, token- or page-grain scale)
+        # is ~18 B/page at r'=2 int4; resid is the out-of-subspace scatter.
+        if coords == "lse":
+            rc = r // 2 if self.c_bits == 4 else r
+            self.quad_c = torch.zeros(L, NB, n_kv, page, rc, device=device,
+                                      dtype=i8)
+            if c_grain == "token":
+                self.c_scale = torch.zeros(L, NB, n_kv, page, device=device,
+                                           dtype=f16)
+            else:
+                self.c_scale = torch.zeros(L, NB, n_kv, device=device,
+                                           dtype=f16)
+            self.quad_resid = torch.zeros(L, NB, n_kv, device=device,
+                                          dtype=f16)
+        else:
+            self.quad_c = self.c_scale = self.quad_resid = None
+
         # ---- per-step outputs / scratch (request-row keyed) -------------- #
         # IDENTICAL to R8State so derive_page_params + topb_select are reused.
         self.score = torch.empty(R, n_kv, MP, device=device, dtype=f32)
         self.page_table = torch.empty(R, n_kv, MP, device=device, dtype=i32)
         self.page_cnt = torch.zeros(R, n_kv, device=device, dtype=i32)
+
+        # ---- NRM combine scratch: per-head scores + per-head page-max ----- #
+        # Only for combine="nrm" (default): the score kernel writes the per-head
+        # S[g] here, then two fixed passes reduce sum_g exp(S[g] - max_page S[g])
+        # into st.score (graph-safe).  combine="max" leaves these None.
+        if combine == "nrm":
+            self.score_h = torch.empty(R, n_kv, G, MP, device=device, dtype=f32)
+            self.hmax = torch.zeros(R, n_kv, G, device=device, dtype=f32)
+        else:
+            self.score_h = self.hmax = None
 
         # ---- per-request derived params (BatchedDecodeState-style) ------- #
         self.n_pages = torch.zeros(R, device=device, dtype=i32)
@@ -96,10 +135,14 @@ class QuadState:
 
     # --------------------------------------------------------------------- #
     def bytes_per_layer(self) -> int:
-        return (self.quad_mu[0].numel() + self.quad_V[0].numel()
-                + self.quad_sig2[0].numel() * 2
-                + self.mu_scale[0].numel() * 2 + self.V_scale[0].numel() * 2
-                + self.quad_tag[0].numel() * 2)
+        n = (self.quad_mu[0].numel() + self.quad_V[0].numel()
+             + self.quad_sig2[0].numel() * 2
+             + self.mu_scale[0].numel() * 2 + self.V_scale[0].numel() * 2
+             + self.quad_tag[0].numel() * 2)
+        if self.coords == "lse":
+            n += (self.quad_c[0].numel() + self.c_scale[0].numel() * 2
+                  + self.quad_resid[0].numel() * 2)
+        return n
 
     def layer_state(self, layer: int):
         """Return the per-layer (mu, mu_scale, V, V_scale, sig2, tag) views for

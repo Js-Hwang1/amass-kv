@@ -27,7 +27,8 @@ from .build import (r8_build_bulk, r8_build_delta, r8_build_refresh,
                     r8_build_tail)
 from .quad_build import (quad_build_bulk, quad_build_delta,
                          quad_build_refresh, quad_build_tail)
-from .quad_score import quad_score, select_pages_quad
+from .quad_score import (clse_score, quad_score, select_pages_clse,
+                         select_pages_quad)
 from .quad_state import QuadState
 from .score import r8_score
 from .select import derive_page_params, select_pages_r8, topb_select
@@ -52,4 +53,7 @@ __all__ = [
     "quad_build_delta",
     "quad_score",
     "select_pages_quad",
+    # ---- clse score mode (quad geometry + rank-r' per-key coords + resid) --- #
+    "clse_score",
+    "select_pages_clse",
 ]

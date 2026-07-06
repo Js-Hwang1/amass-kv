@@ -88,9 +88,13 @@ class Tier:
                    capture: bool = False) -> None:
         """Residency invalidation + staging stage/flush/alloc lifecycle. Fixed
         order: invalidate (drops stale residency/validity) THEN staging (whose
-        internal order is the I4 mechanism)."""
-        self.residency.invalidate_written(block_table, seq_lens,
-                                           query_start_loc)
+        internal order is the I4 mechanism). ``capture`` (cudagraph-capture
+        dummy batches) skips BOTH mutations: the dummy block table carries
+        arbitrary real block ids, so invalidating from it would drop live
+        residency/validity for pages that were never rewritten."""
+        if not capture:
+            self.residency.invalidate_written(block_table, seq_lens,
+                                              query_start_loc)
         self.staging.begin_step(
             block_table, seq_lens, query_start_loc, max_query_len, n_tokens,
             pool=self.pool.dev_view, pool_valid=self.residency.pool_valid,

@@ -44,16 +44,21 @@ _I32_MAX = tl.constexpr(2147483647)
 
 @triton.jit
 def _miss_diff_kernel(tab_ptr, cnt_ptr, bt_ptr, sl_ptr,
-                      p2s_ptr, lru_ptr, clock_ptr,
-                      mpage_ptr, mcnt_ptr,
+                      p2s_ptr, lru_ptr, clock_ptr, fcnt_ptr,
                       NB, S, MP, NKV, stride_btr, stride_tr, stride_cr,
+                      mpage_ptr, mcnt_ptr,
                       PAGE: tl.constexpr, BLOCK: tl.constexpr):
     """Per (request, kv-head): classify each selected COMPLETE page as a hot HIT
     (page2slot>=0, touch its LRU so it cannot be evicted this step) or a MISS
     (compact its physical block into mpage). Partial-tail pages are neither (the
-    decode reads them from staged v_pool). Ports ``_vt_miss_diff_kernel``."""
+    decode reads them from staged v_pool). VARIABLE-count native: ``n`` is the
+    per-unit page_cnt device value. Program (0,0) also zeroes the flat fetch
+    counter (no appends happen before the victims launch -> race-free).
+    Ports ``_vt_miss_diff_kernel``."""
     r = tl.program_id(0)
     kv = tl.program_id(1)
+    if (r == 0) & (kv == 0):
+        tl.store(fcnt_ptr, 0)
     n = tl.load(cnt_ptr + r * stride_cr + kv)
     sl = tl.load(sl_ptr + r)
     clk = tl.load(clock_ptr)
@@ -81,12 +86,18 @@ def _miss_diff_kernel(tab_ptr, cnt_ptr, bt_ptr, sl_ptr,
 def _select_victims_kernel(mpage_ptr, mcnt_ptr,
                            p2s_ptr, s2p_ptr, lru_ptr, clock_ptr,
                            victim_ptr, ovf_ptr,
+                           flist_ptr, fcnt_ptr, FCAP,
                            n_req, NB, S, MP, stride_tr, stride_cr,
                            BLOCK_S: tl.constexpr):
     """Per kv-head, sequential over (request, miss): pick the exact-LRU victim
     slot (min lru_clock among slots NOT touched this step), evict its old page,
     install the miss page, dedup pages already resident (shared prefix). SINGLE
-    owner of the (page2slot, slot2page) transition (I2/I3). Ports
+    owner of the (page2slot, slot2page) transition (I2/I3). Every INSTALLED
+    miss is also appended (atomically) to the FLAT fetch list (kv, blk, slot)
+    -- the fetch kernel then walks [0, fetch_cnt) with a small strided grid
+    instead of the (n_req*MP, n_kv) mostly-idle grid (measured 26us of pure
+    idle-wave overhead per layer-step at 128 misses). Dedup keeps the list
+    unique, so the strided fetch is race-free. Ports
     ``_vt_select_victims_kernel``."""
     kv = tl.program_id(0)
     clk = tl.load(clock_ptr)
@@ -121,6 +132,11 @@ def _select_victims_kernel(mpage_ptr, mcnt_ptr,
                     tl.store(s2p_ptr + kv * S + best_s, blk)
                     tl.store(lru_ptr + kv * S + best_s, clk)
                     tl.store(victim_ptr + r * stride_tr + kv * MP + i, best_s)
+                    fi = tl.atomic_add(fcnt_ptr, 1)
+                    if fi < FCAP:
+                        tl.store(flist_ptr + fi * 3 + 0, kv)
+                        tl.store(flist_ptr + fi * 3 + 1, blk)
+                        tl.store(flist_ptr + fi * 3 + 2, best_s)
 
 
 @triton.jit
@@ -175,6 +191,61 @@ def _gather_kernel(pool_ptr, hot_ptr, vp_ptr, vbo_ptr, valid_ptr,
                     if HAS_K:
                         tl.store(hotk_ptr + hot_off + tile,
                                  tl.load(poolk_ptr + pool_off + tile))
+
+
+@triton.jit
+def _fetch_flat_kernel(pool_ptr, hot_ptr, vp_ptr, vbo_ptr, valid_ptr,
+                       poolk_ptr, hotk_ptr, kp_ptr,
+                       flist_ptr, fcnt_ptr,
+                       lidx, NB, S, NKV, FCAP,
+                       svb, svt, svh,
+                       GRID: tl.constexpr, PAGE: tl.constexpr,
+                       D: tl.constexpr, HAS_K: tl.constexpr):
+    """Flat-list miss fetch: program p copies pages p, p+GRID, ... of the
+    COMPACTED (kv, blk, slot) fetch list -- the grid is a small constant
+    (GRID programs) instead of (n_req*MP, n_kv), so the idle-wave cost is ~1
+    wave regardless of MP (the old grid measured 26us of PURE overhead per
+    layer-step at 128 misses), and the per-page work is identical to
+    ``_gather_kernel`` (pinned zero-copy if flushed, else staged with lazy
+    write-through to the pinned pool). Load-balanced across the DYNAMIC b_u
+    skew by construction (page-level striding, not unit-level)."""
+    pid = tl.program_id(0)
+    n = tl.minimum(tl.load(fcnt_ptr), FCAP)
+    offs_t = tl.arange(0, PAGE)
+    offs_d = tl.arange(0, D)
+    tile = offs_t[:, None] * D + offs_d[None, :]
+    for i in range(pid, n, GRID):
+        kv = tl.load(flist_ptr + i * 3 + 0)
+        blk = tl.load(flist_ptr + i * 3 + 1)
+        slot = tl.load(flist_ptr + i * 3 + 2)
+        vld = tl.load(valid_ptr + kv * NB + blk)
+        pool_off = (((lidx * NB + blk) * NKV + kv).to(tl.int64) * (PAGE * D))
+        hot_off = ((kv * S + slot).to(tl.int64) * (PAGE * D))
+        if vld > 0:
+            tl.store(hot_ptr + hot_off + tile,
+                     tl.load(pool_ptr + pool_off + tile))
+            if HAS_K:
+                tl.store(hotk_ptr + hot_off + tile,
+                         tl.load(poolk_ptr + pool_off + tile))
+        else:
+            vb = tl.load(vbo_ptr + blk)
+            if vb >= 0:
+                stg = vb.to(tl.int64) * svb + kv * svh \
+                    + offs_t[:, None] * svt + offs_d[None, :]
+                v16 = tl.load(vp_ptr + stg).to(tl.int16, bitcast=True)
+                tl.store(hot_ptr + hot_off + tile, v16)
+                tl.store(pool_ptr + pool_off + tile, v16)
+                if HAS_K:
+                    k16 = tl.load(kp_ptr + stg).to(tl.int16, bitcast=True)
+                    tl.store(hotk_ptr + hot_off + tile, k16)
+                    tl.store(poolk_ptr + pool_off + tile, k16)
+                tl.store(valid_ptr + kv * NB + blk, tl.cast(1, tl.int8))
+            else:
+                tl.store(hot_ptr + hot_off + tile,
+                         tl.load(pool_ptr + pool_off + tile))
+                if HAS_K:
+                    tl.store(hotk_ptr + hot_off + tile,
+                             tl.load(poolk_ptr + pool_off + tile))
 
 
 @triton.jit
@@ -256,13 +327,24 @@ class Residency:
         self.miss_cnt = torch.zeros((max_reqs, n_kv), dtype=i32, device=dev)
         self.victim_slots = torch.zeros((max_reqs, n_kv, max_pages),
                                         dtype=i32, device=dev)
+        # ---- flat fetch list: (kv, blk, slot) per INSTALLED miss ---------- #
+        # Sized to the dedup-free worst case (every unit misses every selected
+        # page) so the append guard NEVER truncates -- a truncated append
+        # would install a residency mapping without its bytes (I2 violation).
+        # The fetch kernel walks [0, fetch_cnt) with a small strided grid
+        # (fetch_grid programs), decoupling launch overhead from max_pages.
+        self.FCAP = max_reqs * n_kv * max_pages
+        self.fetch_list = torch.zeros((self.FCAP, 3), dtype=i32, device=dev)
+        self.fetch_cnt = torch.zeros((1,), dtype=i32, device=dev)
+        self.fetch_grid = 1024
 
         elem = torch.empty(0, dtype=dtype).element_size()
         hot_n = self.hot.numel() + (self.hot_k.numel() if offload_k else 0)
         self.hot_gib = hot_n * elem / 2**30
         self.maps_gib = sum(t.numel() * t.element_size() for t in (
             self.page2slot, self.slot2page, self.lru_clock, self.pool_valid,
-            self.miss_pages, self.miss_cnt, self.victim_slots)) / 2**30
+            self.miss_pages, self.miss_cnt, self.victim_slots,
+            self.fetch_list, self.fetch_cnt)) / 2**30
 
     # --------------------------------------------------------------------- #
     # Per-step lifecycle (outside the graph unless noted)                   #
@@ -312,14 +394,15 @@ class Residency:
         self.clock += 1
         _miss_diff_kernel[(n_req, n_kv)](
             page_table, page_cnt, block_table, seq_lens,
-            self.page2slot[l], self.lru_clock[l], self.clock,
-            self.miss_pages, self.miss_cnt,
+            self.page2slot[l], self.lru_clock[l], self.clock, self.fetch_cnt,
             NB, S, MP, n_kv, block_table.stride(0), page_table.stride(0),
-            page_cnt.stride(0), PAGE=self.page, BLOCK=256, num_warps=4)
+            page_cnt.stride(0), self.miss_pages, self.miss_cnt,
+            PAGE=self.page, BLOCK=256, num_warps=4)
         _select_victims_kernel[(n_kv,)](
             self.miss_pages, self.miss_cnt,
             self.page2slot[l], self.slot2page[l], self.lru_clock[l], self.clock,
             self.victim_slots, self.overflow,
+            self.fetch_list, self.fetch_cnt, self.FCAP,
             n_req, NB, S, MP, self.miss_pages.stride(0),
             self.miss_cnt.stride(0), BLOCK_S=1024, num_warps=4)
 
@@ -327,9 +410,14 @@ class Residency:
                      poolk=None) -> None:
         """Fetch the planned MISS pages' V (and K, mem-kv) into their hot victim
         slots (pinned zero-copy or staged write-through). The ONLY PCIe-touching
-        step; runs on ``stream`` if given (async prefetch / double-buffer)."""
+        step; runs on ``stream`` if given (async prefetch / double-buffer).
+        Walks the FLAT (kv, blk, slot) list ``gather_plan`` compacted with a
+        small strided grid: the launch cost no longer scales with
+        n_req*max_pages (26us of idle-grid overhead at 16K ctx measured on the
+        old (n_req*MP, n_kv) grid) and the work is page-level load-balanced
+        regardless of the dynamic per-unit b_u skew."""
         l = layer
-        n_kv, S, NB, MP = self.n_kv, self.S, self.NB, self.MP
+        n_kv, S, NB = self.n_kv, self.S, self.NB
         vp = staging.v_pool[l]                     # (NV, page, n_kv, d) bf16
         has_k = self.hot_k_i16 is not None
         kp = staging.k_pool[l] if has_k else vp
@@ -338,14 +426,14 @@ class Residency:
         ctx = torch.cuda.stream(stream) if stream is not None \
             else contextlib.nullcontext()
         with ctx:
-            _gather_kernel[(n_req * MP, n_kv)](
+            _fetch_flat_kernel[(self.fetch_grid,)](
                 pool, self.hot_i16[l], vp, staging.vbo, self.pool_valid[l],
                 pk, hotk, kp,
-                self.miss_pages, self.miss_cnt, self.victim_slots,
-                l, NB, S, MP, n_kv, self.miss_pages.stride(0),
-                self.miss_cnt.stride(0),
+                self.fetch_list, self.fetch_cnt,
+                l, NB, S, n_kv, self.FCAP,
                 vp.stride(0), vp.stride(1), vp.stride(2),
-                PAGE=self.page, D=self.d, HAS_K=has_k, num_warps=4)
+                GRID=self.fetch_grid, PAGE=self.page, D=self.d, HAS_K=has_k,
+                num_warps=4)
 
     def build_dma_plan(self, layer, pool, n_req, poolk=None):
         """Build the copy-engine descriptor list for the FLUSHED (pinned) miss

@@ -1,23 +1,52 @@
-# `amass/tier/` — the DRAM V-offload tier (AMASS-mem-v)
+# `amass/tier/` — the DRAM KV-offload tier (AMASS-mem-v / mem-kv)
 
-The memory play: the V half of the KV cache lives in a pinned, device-mapped
-**host DRAM** pool; only a bounded **hot buffer** + **staging pool** stay in
-VRAM. K stays resident. This is the clean rewrite of the prototype's
+The memory play: the V half (mem-v) or K+V (mem-kv) of the KV cache lives in a
+pinned, device-mapped **host DRAM** pool; only a bounded **hot buffer** +
+**staging pool** stay in VRAM. This is the clean rewrite of the prototype's
 `vllm/kernels/dram_tier.py` (1762 lines of debug cruft), restructured so the two
 confirmed mem bugs are fixed **by construction** via four written invariants.
 
-This directory is a **scaffold**: real, coherent interfaces + the
-invariant-enforcing skeleton that compiles and imports cleanly. The V-byte-moving
-kernels are simple/torch references or documented follow-up hooks.
+STATUS 2026-07: the tier is **functionally complete and gated at the kernel /
+module level** — write path, flush lifecycle, exact-LRU residency, miss fetch,
+and the DYNAMIC-budget tiered decode (`decode_mem.py`) run end-to-end and are
+BITWISE-equal to the resident decode through multi-step chunked-prefill +
+decode lifecycles (mns 1/2/4, forced eviction, CUDA-graph replay; see
+`tests/test_mem_dynamic.py`). The remaining follow-up is the vLLM SERVING
+integration (below), not tier machinery.
 
 ## Module layout
 
 | module | owns | status |
 |---|---|---|
-| `pool.py` | `MappedHostVPool` — pinned host V pool + UVA device pointer | **real** (UVA, sizing, cap) |
-| `residency.py` | `Residency` — hot buffer, exact-LRU maps, gather (I2/I3) | buffers + asserts real; `gather` = follow-up |
-| `staging.py` | `Staging` — v_pool + per-step flush/alloc lifecycle (I1/I4) | buffers + `begin_step` ordering + asserts real; sub-step bodies = torch refs (TODO kernelize) |
-| `tier.py` | `Tier` facade + `TierVSource` (the `V_SRC==1` seam) | facade + begin_step + invariant checks real; write/step/vsource-union = follow-up hooks |
+| `pool.py` | `MappedHostVPool` — pinned host K/V pools + UVA device pointer | **real** (UVA, sizing, cap) |
+| `residency.py` | `Residency` — hot buffer, exact-LRU maps, graph-safe plan + flat-list miss fetch (I2/I3) | **real** (Triton, graph-safe, variable-count native) |
+| `staging.py` | `Staging` — staging pools + per-step flush/alloc lifecycle (I1/I4) | **real** (Triton, graph-safe; free-after-flush for ALL requests keeps the O(chunk) bound) |
+| `tier.py` | `Tier` facade + `TierVSource` (the `V_SRC==1` seam) | **real** (begin_step skips mutation on capture batches) |
+| `decode_mem.py` | the DYNAMIC-budget mem tiered decode: variable per-unit fetch + ptr-select split-K decode | **real** (bitwise vs resident; graph-capturable) |
+
+## The dynamic-budget decode (`decode_mem.py`)
+
+`mem_dynamic_decode(q, kv_cache, block_table, seq_lens, st, out, tier, lidx)`
+consumes the Stage-A interface `st.page_table` (R, n_kv, MP; ascending, -1
+padded, sink+window+tail forced) + `st.page_cnt` (R, n_kv; **VARIABLE** per
+(layer, kv-head) unit under the dynamic budget), and per layer:
+
+1. `tier.step` — graph-safe residency gather: miss classify + exact-LRU
+   victims (`gather_plan`), then the **flat-list fetch** (`gather_fetch`): the
+   victims kernel compacts every installed miss into a `(kv, blk, slot)` list
+   and a small strided grid (1024 programs) copies it — launch cost decoupled
+   from `n_req*max_pages` and page-level load-balanced across any b_u skew.
+2. the **ptr-select** tiered split-K decode + merge: the hot|staged|pinned
+   3-way select is computed once per page on the ADDRESS (all sources
+   addressed as int16 bits), one load per K/V tile. Bitwise-equal to the
+   shared `V_SRC==1` seam kernel and to the resident decode.
+
+Measured (H200, 4x16K reqs, budget 0.10, 98% steady hot-hit, CUDA-graph
+replay): plan 7.1us + fetch 2.3us + decode 31.6us per layer-step vs 29.6us
+resident decode. Fetch transport = UVA kernel at 45-50 GiB/s = **84-92% of the
+contiguous-PCIe roofline (53.7 GiB/s)**; copy-engine DMA on scattered top-b
+pages is launch-bound (~1.6 GiB/s over ~1-page runs) and stays reserved for
+the `fetch="dma"` escape hatch.
 
 ## The invariant contract (`AMASS_DESIGN.md` §8.3)
 
@@ -71,38 +100,39 @@ compile-time `SRC_ID`. `ResidentVSource` (fast) is `V_SRC==0`; `TierVSource`
 4-tuple contract; `TierVSource.union()` exposes the full 3-way pointer union the
 follow-up decode kernel consumes (hot | staged v_pool | pinned pool).
 
-## Scaffolded vs stubbed vs FOLLOW-UP
+## Done vs FOLLOW-UP
 
-**Scaffolded (real):** all persistent buffers + sizing; `pool.py` UVA mapping;
-`Tier`/`Staging`/`Residency` construction; `begin_step` orchestration + the I4
-call order; every invariant assertion; the `TierVSource`/`union()` seam; the
-backend wiring (builder allocates the tier + drives `begin_step` outside the
-graph; impl builds the seam and delegates to stock FA until the tiered load
-lands; readiness flag `_runtime.mem_stageb_wired()`).
+**Done (real, gated by `tests/test_mem_dynamic.py`, all Triton, graph-safe):**
+every persistent buffer + sizing; `pool.py` UVA mapping; the full `Staging`
+lifecycle (`_vflush_clear` / `_flush_collect` / `_flush_copy` / `_valloc` /
+`_vslot` — bit-exact int16 flush copies; **free-after-flush for ALL requests**,
+so chunked prefill of any length stays inside the O(chunk) staging bound);
+`Tier.write_kv` scatter (`_scatter_kv_kernel`, K+V for mem-kv);
+`Residency.invalidate_written` (skipped on cudagraph-capture dummy batches —
+a dummy block table must never drop live residency/validity);
+`Residency.gather` = `gather_plan` (miss diff + exact-LRU victims + flat-list
+compaction) + `gather_fetch` (strided flat fetch, variable-count native);
+the `V_SRC==1`/`K_SRC==1` 3-way load in `attention/decode.py` AND the faster
+ptr-select tiered decode in `decode_mem.py`; copy-engine DMA
+(`gather_fetch_dma`, correctness-gated; launch-bound on scattered pages —
+kernel transport is the default).
 
-**Stubbed (torch reference / no-op, TODO kernelize):** `Staging` sub-steps
-(`_vflush_clear` / `_flush_collect` / `_flush_copy` / `_valloc` / `_vslot`) are
-correct but host-syncing; `_flush_copy`'s actual byte copy is a no-op that only
-advances validity (state machine testable; bytes not yet in the pinned pool);
-`Residency.invalidate_written` is a minimal torch reference.
+Gates: bitwise mem==resident through chunked-prefill + multi-step decode
+(mem-kv and mem-v), matched-mns {1,2,4}, forced eviction (pinned-fallback
+decode), DMA transport, CUDA-graph capture/replay, real Llama-3.1-8B 28K K +
+real decode queries, I1-I4 invariants every step, dynamic>=static retained
+mass.
 
-**FOLLOW-UP (to make mem-v decode end-to-end):**
-1. **`V_SRC==1` decode load** — flesh the documented `else` arm in
-   `attention/decode.py` **and** `attention/decode_cuda.py` into the 3-way read
-   (hot via `page2slot`+complete, staged via `vbo`, pinned via `pool_off`),
-   keyed by `pool_valid`+`vbo`, taking the extra pointers from
-   `TierVSource.union()`. Reference: `_p2_sparse_decode_split_kernel` in
-   `vllm/kernels/dram_tier.py`. *(Owned by the decode/selection agent — do not
-   edit those two files from the tier side.)*
-2. **`Tier.write_kv`** — in-graph scatter K→engine (K-only) / V→`v_pool` via
-   `v_slot_mapping`, replacing `reshape_and_cache_flash`. Port
-   `_p2_scatter_kv_kernel`.
-3. **`Residency.gather` + `Tier.step`** — graph-safe per-layer gather into `hot`.
-   Port `_vt_miss_diff_kernel` + `_select_victims_kernel` + `_p2_gather_kernel`.
-4. **Graph-safe port** of the `Staging` sub-step bodies + the real `_flush_copy`
-   bit-exact host copy (`_p2_*` kernels).
-5. **K-only spec patch** — `backend/register._patch_kv_cache_spec_k_only`
-   (`head_size_v=0`), applied together with (1) so attention never loses its V
-   half without a tier replacement.
-6. Flip `_runtime._MEM_STAGEB_WIRED = True` and validate with
-   `scratch_dram_repro/sys_equality.py` at matched mns=1 and mns>=3.
+**FOLLOW-UP (vLLM serving integration; the tier machinery is ready):**
+1. **Impl wiring** — `backend/attn.py::_forward_mem`: call the Stage-A
+   selection, `tier.write_kv` on every step (prefill + decode), then
+   `tier.step` + the tiered decode (`amass.tier.mem_dynamic_decode`) on pure
+   decode. Needs mem-variant Stage-A state in the builder (the r8/quad state
+   is currently fast-only).
+2. **K-only spec patch** — `backend/register._patch_kv_cache_spec_k_only`
+   (`head_size_v=0`), applied together with (1) so attention never loses its
+   V half without a tier replacement (this is what realizes the VRAM saving).
+3. Flip `_runtime._MEM_STAGEB_WIRED = True` and validate with
+   `scratch_dram_repro/sys_equality.py` at matched mns=1 and mns>=3 (the
+   module-level matched-mns gate in `tests/test_mem_dynamic.py` is the
+   kernel-layer half of that gate and is green).

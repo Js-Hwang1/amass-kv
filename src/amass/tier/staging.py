@@ -98,17 +98,23 @@ def _flush_collect_kernel(bt_ptr, sl_ptr, qsl_ptr, vbo_ptr, vfl_ptr,
                           stride_btr, MAXF, N_REQ,
                           PAGE: tl.constexpr, BLOCK: tl.constexpr):
     """Collect complete un-flushed staged pages into the flush list (claim via
-    atomic_xchg on v_flushed) and free decode requests' staged blocks -- the free
-    happens ONLY after the flush claim (I1). Grid (1,), SERIALIZED over requests
-    (shared flush index + free top raced on a per-request grid = the old wrong-V
-    bug). Ports ``_p2_flush_collect_kernel``."""
+    atomic_xchg on v_flushed) and free their staged blocks -- the free happens
+    ONLY after the flush claim (I1), and ``flush_copy`` reads via the CAPTURED
+    (blk, vb) pairs in the flush list, never via ``vbo``, so the free is safe
+    the same step (I4 = the begin_step call order: collect -> copy -> valloc).
+    Freeing applies to ALL requests, prefill included: a chunked prefill flushes
+    chunk k's pages while writing chunk k+1, keeping the concurrent staged peak
+    at ~2 chunks + tails -- the O(chunk) bound ``assert_capacity`` states. (The
+    earlier decode-only free let long prefills accumulate the WHOLE prefix in
+    staging and underflow valloc; the prototype's #1 root cause.) Grid (1,),
+    SERIALIZED over requests (shared flush index + free top raced on a
+    per-request grid = the old wrong-V bug). Ports ``_p2_flush_collect_kernel``."""
     for r in range(N_REQ):
         sl = tl.load(sl_ptr + r)
         ql = tl.load(qsl_ptr + r + 1) - tl.load(qsl_ptr + r)
         if (sl > 0) & (ql > 0):
             ctx = sl - ql
             np_ctx = ctx // PAGE
-            decode = ql == 1
             for p0 in range(0, np_ctx, BLOCK):
                 offs = p0 + tl.arange(0, BLOCK)
                 pmask = offs < np_ctx
@@ -129,15 +135,14 @@ def _flush_collect_kernel(bt_ptr, sl_ptr, qsl_ptr, vbo_ptr, vfl_ptr,
                 if n_over > 0:
                     tl.atomic_add(fcnt_ptr, -n_over)
                 tl.store(vfl_ptr + blk, tl.zeros([BLOCK], tl.int32), mask=over)
-                if decode:
-                    fre = act & (over == 0)
-                    old = tl.atomic_xchg(vbo_ptr + blk,
-                                         tl.full([BLOCK], -1, tl.int32),
-                                         mask=fre)
-                    do = fre & (old >= 0)
-                    j = tl.atomic_add(top_ptr + offs * 0,
-                                      tl.full([BLOCK], 1, tl.int32), mask=do)
-                    tl.store(stack_ptr + j, old, mask=do)
+                fre = act & (over == 0)
+                old = tl.atomic_xchg(vbo_ptr + blk,
+                                     tl.full([BLOCK], -1, tl.int32),
+                                     mask=fre)
+                do = fre & (old >= 0)
+                j = tl.atomic_add(top_ptr + offs * 0,
+                                  tl.full([BLOCK], 1, tl.int32), mask=do)
+                tl.store(stack_ptr + j, old, mask=do)
 
 
 @triton.jit
