@@ -118,6 +118,7 @@ def _force_bridge() -> bool:
 _SEL_CUDA = None
 _DEC_CUDA = None
 _QSEL_CUDA = None
+_CSEL_CUDA = None
 
 
 def _layer_index(st, kv_cache) -> int:
@@ -190,9 +191,12 @@ def _quad_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
     selector as the r8 path.  ``derive=False``: the builder derived the per-step
     page params already.
 
-    score="clse" (``st.coords == "lse"``) has no hand-CUDA kernel yet, so it
-    always runs the graph-safe Triton ``clse_score`` reference + the stock
-    (CUDA or Triton) top-b selector."""
+    score="clse" (``st.coords == "lse"``) dispatches to the hand-CUDA
+    ``clse_score_cuda`` (the QI8W_CLSE tensor-core variant: quad mma front end
+    + per-key coord logsumexp tail + iso-resid; covers r'=2 / page 16 /
+    n_kv %% KH == 0 / G <= 8, all coord quant/grain configs) when
+    ``cfg.use_cuda``; unsupported geometry or a build failure latches to the
+    graph-safe Triton ``clse_score`` reference."""
     from .. import selection as sel
 
     lidx = _layer_index(st, kv_cache)
@@ -205,10 +209,28 @@ def _quad_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
             from ..selection import select_cuda
             select_cuda.topb_select_cuda(st, n_req)
 
-    # CLSE: Triton reference score (graph-safe) + top-b.  The nrm combine is
-    # applied inside ``clse_score`` when ``st.combine == "nrm"``.
+    # CLSE: CUDA score (latched fallback to the Triton reference) + top-b.
+    # The nrm combine is folded into both score paths.
     if getattr(st, "coords", "none") == "lse":
-        sel.clse_score(st, lidx, q, block_table, seq_lens, n_req, scale)
+        global _CSEL_CUDA
+        done = False
+        if cfg.use_cuda and _CSEL_CUDA is not False:
+            try:
+                from ..selection import quad_score_cuda
+                quad_score_cuda.clse_score_cuda(st, lidx, q, block_table,
+                                                seq_lens, n_req, scale)
+                done = True
+                if _CSEL_CUDA is None:
+                    _CSEL_CUDA = True
+                    print("[amass] selection kernels: CUDA clse_score + CUDA "
+                          "radix top-b", flush=True)
+            except Exception as e:  # noqa: BLE001
+                _CSEL_CUDA = False
+                print(f"[amass] CUDA clse selection unavailable "
+                      f"({type(e).__name__}: {e}) -> Triton clse_score",
+                      flush=True)
+        if not done:
+            sel.clse_score(st, lidx, q, block_table, seq_lens, n_req, scale)
         if cfg.use_cuda:
             try:
                 _topb()

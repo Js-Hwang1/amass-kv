@@ -240,11 +240,16 @@ def mem_dynamic_decode(q: torch.Tensor, kv_cache: Optional[torch.Tensor],
     only ``"kernel"`` is CUDA-graph capturable.
 
     ``impl``: ``"ptrsel"`` (default) = the address-selected single-load tiered
-    kernel in this module. Measured in-graph on H200 (4x16K reqs, 10% budget,
-    98% hot-hit): mem-kv 44.3 -> 31.6us (+6.8% over the resident decode's
-    29.6us, down from +49%), mem-v 35.8 -> 31.2us (+6.5%); output BITWISE
-    equal to both the shared kernel and the resident decode.
-    ``"shared"`` = the ``V_SRC==1`` 3-way-data-select seam kernel in
+    TRITON kernel in this module. Measured in-graph on H200 (4x16K reqs, 10%
+    budget, 98% hot-hit): mem-kv 44.3 -> 31.6us (+6.8% over the resident
+    decode's 29.6us, down from +49%), mem-v 35.8 -> 31.2us (+6.5%); output
+    BITWISE equal to both the shared kernel and the resident decode.
+    ``"cuda"`` = the hand-CUDA decode's ``V_SRC==1`` tiered arm (FINAL-OPT):
+    the SAME per-page ptr-select (hot | staged | pinned, int16 pure-bit
+    addressing) inside ``attention/decode_cuda.py``'s split/fused kernels --
+    the fast path's kernel speed with tiered bytes, batch-dispatched like the
+    resident CUDA decode, bitwise-equal to the resident CUDA decode on equal
+    bytes.  ``"shared"`` = the ``V_SRC==1`` 3-way-data-select seam kernel in
     attention/decode.py (kept as the cross-check reference).
     """
     if fetch not in _FETCH_MODES:
@@ -259,6 +264,11 @@ def mem_dynamic_decode(q: torch.Tensor, kv_cache: Optional[torch.Tensor],
     if impl == "ptrsel":
         mem_decode_ptrsel(q, kv_cache, block_table, seq_lens, st, out, tier,
                           lidx, scale=scale)
+    elif impl == "cuda":
+        from ..attention.decode_cuda import sparse_paged_decode_batched_cuda
+        sparse_paged_decode_batched_cuda(q, kv_cache, block_table, seq_lens,
+                                         st, out, tier.vsource(lidx),
+                                         scale=scale)
     else:
         sparse_paged_decode_batched(q, kv_cache, block_table, seq_lens, st,
                                     out, tier.vsource(lidx), scale=scale)

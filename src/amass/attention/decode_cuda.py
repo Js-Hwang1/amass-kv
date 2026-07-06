@@ -142,6 +142,74 @@ __device__ __forceinline__ void mma_f16(float d[4], const unsigned a[4],
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return *reinterpret_cast<const unsigned*>(p);
 }
+
+// ---- V_SRC==1: the mem tier's 3-way ptr-select (hot | staged | pinned) ---- //
+// Mirrors tier/decode_mem.py::_mem_decode_split_kernel EXACTLY: ONE scalar
+// source decision per (page, kv-head) -- complete+resident -> hot buffer,
+// vbo>=0 -> staging pool, else pinned host pool over UVA -- with int16
+// pure-bit addressing (the cp.async copies bytes; bf16 is recovered by the
+// smem read), so the tiered bytes are IDENTICAL to the resident bytes by the
+// tier's invariants.  K follows the same select under k_tier (mem-kv);
+// mem-v keeps K resident.
+struct TierArgs {
+  const int16_t* hotv; const int16_t* stgv; const int16_t* poolv;
+  const int16_t* hotk; const int16_t* stgk; const int16_t* poolk;
+  const int* p2s; const int* vbo;
+  long svb, svt, svh, NB, S;
+  int lidx, k_tier;
+};
+struct TieredPage {
+  const __nv_bfloat16* v; long vt;
+  const __nv_bfloat16* k; long kt;
+};
+__device__ __forceinline__ TieredPage tier_page(
+    const TierArgs& ta, int pt, long blk, int kh, int seq_len, int n_kv) {
+  const bool complete = ((long)(pt + 1) * PAGE) <= (long)seq_len;
+  const int slot = ta.p2s[(long)kh * ta.NB + blk];
+  const int vbs  = ta.vbo[blk];
+  const bool use_hot = complete && (slot >= 0);
+  const bool use_stg = (!use_hot) && (vbs >= 0);
+  const long hot_off = ((long)kh * ta.S + (use_hot ? slot : 0)) * (PAGE * DMAX);
+  const long stg_off = (long)(use_stg ? vbs : 0) * ta.svb + (long)kh * ta.svh;
+  const long pin_off = (((long)ta.lidx * ta.NB + blk) * n_kv + kh)
+                       * (PAGE * DMAX);
+  TieredPage tp;
+  tp.v = reinterpret_cast<const __nv_bfloat16*>(
+      use_hot ? ta.hotv + hot_off
+              : use_stg ? ta.stgv + stg_off : ta.poolv + pin_off);
+  tp.vt = use_hot ? DMAX : use_stg ? ta.svt : DMAX;
+  if (ta.k_tier) {
+    tp.k = reinterpret_cast<const __nv_bfloat16*>(
+        use_hot ? ta.hotk + hot_off
+                : use_stg ? ta.stgk + stg_off : ta.poolk + pin_off);
+    tp.kt = tp.vt;
+  } else { tp.k = nullptr; tp.kt = 0; }
+  return tp;
+}
+
+// ---- tier-pack decode: 15 int64s -> TierArgs (see the Python wrappers) --- //
+static TierArgs make_tier_args(const std::vector<int64_t>& tp) {
+  TierArgs ta;
+  if (tp.size() < 15) {          // V_SRC==0: dead args, never dereferenced
+    ta.hotv = ta.stgv = ta.poolv = ta.hotk = ta.stgk = ta.poolk = nullptr;
+    ta.p2s = ta.vbo = nullptr;
+    ta.svb = ta.svt = ta.svh = ta.NB = ta.S = 0;
+    ta.lidx = ta.k_tier = 0;
+    return ta;
+  }
+  ta.hotv  = reinterpret_cast<const int16_t*>(tp[0]);
+  ta.stgv  = reinterpret_cast<const int16_t*>(tp[1]);
+  ta.poolv = reinterpret_cast<const int16_t*>(tp[2]);
+  ta.hotk  = reinterpret_cast<const int16_t*>(tp[3]);
+  ta.stgk  = reinterpret_cast<const int16_t*>(tp[4]);
+  ta.poolk = reinterpret_cast<const int16_t*>(tp[5]);
+  ta.p2s   = reinterpret_cast<const int*>(tp[6]);
+  ta.vbo   = reinterpret_cast<const int*>(tp[7]);
+  ta.svb = tp[8]; ta.svt = tp[9]; ta.svh = tp[10];
+  ta.NB = tp[11]; ta.S = tp[12];
+  ta.lidx = (int)tp[13]; ta.k_tier = (int)tp[14];
+  return ta;
+}
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
   unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
   asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::
@@ -183,7 +251,7 @@ __global__ __launch_bounds__(WARPS * 32) void amass_decode_split(
     const long kb, const long kt, const long kh_s,
     const long vb, const long vt, const long vh_s,
     const long btr, const long tabr, const long tabh,
-    const long cntr, const long stride_pr) {
+    const long cntr, const long stride_pr, const TierArgs ta) {
   const int sp = blockIdx.x;
   const int kh = blockIdx.y;
   const int r  = blockIdx.z;
@@ -227,10 +295,16 @@ __global__ __launch_bounds__(WARPS * 32) void amass_decode_split(
     __nv_bfloat16* Vd = Vs + (long)stage * PAGE * SSTRIDE;
     const __nv_bfloat16* kg = k + blk * kb + (long)kh * kh_s;
     const __nv_bfloat16* vg = v + blk * vb + (long)kh * vh_s;
+    long ktk = kt, vtk = vt;
+    if (V_SRC == 1) {
+      const TieredPage tp = tier_page(ta, pt, blk, kh, seq_len, n_kv);
+      vg = tp.v; vtk = tp.vt;
+      if (ta.k_tier) { kg = tp.k; ktk = tp.kt; }
+    }
     for (int i = tid; i < PAGE * DMAX / 8; i += WARPS * 32) {
       int t = (i * 8) >> 7, d = (i * 8) & 127;
-      cp_async16(&Kd[t * SSTRIDE + d], &kg[(long)t * kt + d]);
-      cp_async16(&Vd[t * SSTRIDE + d], &vg[(long)t * vt + d]);
+      cp_async16(&Kd[t * SSTRIDE + d], &kg[(long)t * ktk + d]);
+      cp_async16(&Vd[t * SSTRIDE + d], &vg[(long)t * vtk + d]);
     }
   };
 
@@ -446,7 +520,8 @@ __global__ __launch_bounds__(WFT) void amass_decode_fused(
     const long kb, const long kt, const long kh_s,
     const long vb, const long vt, const long vh_s,
     const long btr, const long tabr, const long tabh,
-    const long cntr, const long stride_ot, const long stride_oh) {
+    const long cntr, const long stride_ot, const long stride_oh,
+    const TierArgs ta) {
   const int kh = blockIdx.x;
   const int r  = blockIdx.y;
   const int tid  = threadIdx.x;            // 0..WFT-1
@@ -495,13 +570,19 @@ __global__ __launch_bounds__(WFT) void amass_decode_fused(
     const long blk = bt[(long)r * btr + pt];
     const __nv_bfloat16* kg = k + blk * kb + (long)kh * kh_s;
     const __nv_bfloat16* vg = v + blk * vb + (long)kh * vh_s;
+    long ktk = kt, vtk = vt;
+    if (V_SRC == 1) {
+      const TieredPage tp = tier_page(ta, pt, blk, kh, seq_len, n_kv);
+      vg = tp.v; vtk = tp.vt;
+      if (ta.k_tier) { kg = tp.k; ktk = tp.kt; }
+    }
     __nv_bfloat16* Kb = Ks + ((long)buf * NPG + pg) * PGSLOT;
     __nv_bfloat16* Vb = Vs + ((long)buf * NPG + pg) * PGSLOT;
     const int gtid = dw * 32 + lane;         // 0..127 within the group
     for (int i = gtid; i < PAGE * DMAX / 8; i += 128) {
       int t = (i * 8) >> 7, d = (i * 8) & 127;
-      cp_async16(&Kb[t * SSTRIDE + d], &kg[(long)t * kt + d]);
-      cp_async16(&Vb[t * SSTRIDE + d], &vg[(long)t * vt + d]);
+      cp_async16(&Kb[t * SSTRIDE + d], &kg[(long)t * ktk + d]);
+      cp_async16(&Vb[t * SSTRIDE + d], &vg[(long)t * vtk + d]);
     }
   };
 
@@ -696,7 +777,9 @@ __global__ __launch_bounds__(WFT) void amass_decode_fused(
 void amass_decode_fused_launch(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor bt,
     torch::Tensor tab, torch::Tensor cnt, torch::Tensor sl, torch::Tensor out,
-    double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t v_src) {
+    double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t v_src,
+    std::vector<int64_t> tier_pack) {
+  const TierArgs ta = make_tier_args(tier_pack);
   const int d = 128;
   TORCH_CHECK(k.size(-1) == d, "amass_decode_fused: d must be 128");
   TORCH_CHECK(k.size(1) == PAGE, "amass_decode_fused: page must be 16");
@@ -745,7 +828,7 @@ void amass_decode_fused_launch(
         (long)k.stride(0), (long)k.stride(1), (long)k.stride(2),
         (long)v.stride(0), (long)v.stride(1), (long)v.stride(2),
         (long)bt.stride(0), (long)tab.stride(0), (long)tab.stride(1),
-        (long)cnt.stride(0), (long)out.stride(0), (long)out.stride(1));
+        (long)cnt.stride(0), (long)out.stride(0), (long)out.stride(1), ta);
       return;
     }
     kern<<<grid, block, smem, stream>>>(
@@ -756,7 +839,7 @@ void amass_decode_fused_launch(
       (long)k.stride(0), (long)k.stride(1), (long)k.stride(2),
       (long)v.stride(0), (long)v.stride(1), (long)v.stride(2),
       (long)bt.stride(0), (long)tab.stride(0), (long)tab.stride(1),
-      (long)cnt.stride(0), (long)out.stride(0), (long)out.stride(1));
+      (long)cnt.stride(0), (long)out.stride(0), (long)out.stride(1), ta);
   };
   if (v_src == 0) run(amass_decode_fused<0>);
   else            run(amass_decode_fused<1>);
@@ -795,7 +878,7 @@ __global__ __launch_bounds__(WARPS * 32) void amass_decode_split2(
     const long vb, const long vt, const long vh_s,
     const long btr, const long tabr, const long tabh,
     const long cntr, const long stride_pr,
-    const long stride_ot, const long stride_oh) {
+    const long stride_ot, const long stride_oh, const TierArgs ta) {
   const int sp = blockIdx.x;
   const int kh = blockIdx.y;
   const int r  = blockIdx.z;
@@ -844,10 +927,16 @@ __global__ __launch_bounds__(WARPS * 32) void amass_decode_split2(
     __nv_bfloat16* Vd = Vs + (long)stage * PAGE * SSTRIDE;
     const __nv_bfloat16* kg = k + blk * kb + (long)kh * kh_s;
     const __nv_bfloat16* vg = v + blk * vb + (long)kh * vh_s;
+    long ktk = kt, vtk = vt;
+    if (V_SRC == 1) {
+      const TieredPage tp = tier_page(ta, pt, blk, kh, seq_len, n_kv);
+      vg = tp.v; vtk = tp.vt;
+      if (ta.k_tier) { kg = tp.k; ktk = tp.kt; }
+    }
     for (int i = tid; i < PAGE * DMAX / 8; i += WARPS * 32) {
       int t = (i * 8) >> 7, d = (i * 8) & 127;
-      cp_async16(&Kd[t * SSTRIDE + d], &kg[(long)t * kt + d]);
-      cp_async16(&Vd[t * SSTRIDE + d], &vg[(long)t * vt + d]);
+      cp_async16(&Kd[t * SSTRIDE + d], &kg[(long)t * ktk + d]);
+      cp_async16(&Vd[t * SSTRIDE + d], &vg[(long)t * vtk + d]);
     }
   };
   auto page_tok0 = [&](int j) -> long {
@@ -1042,7 +1131,8 @@ void amass_decode_split2_launch(
     torch::Tensor m_part, torch::Tensor l_part, torch::Tensor acc_part,
     torch::Tensor arrive, torch::Tensor out,
     double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t split,
-    int64_t pps_min, int64_t v_src) {
+    int64_t pps_min, int64_t v_src, std::vector<int64_t> tier_pack) {
+  const TierArgs ta = make_tier_args(tier_pack);
   const int d = 128;
   TORCH_CHECK(k.size(-1) == d, "amass_decode_split2: d must be 128");
   TORCH_CHECK(k.size(1) == PAGE, "amass_decode_split2: page must be 16");
@@ -1074,7 +1164,7 @@ void amass_decode_split2_launch(
       (long)v.stride(0), (long)v.stride(1), (long)v.stride(2),
       (long)bt.stride(0), (long)tab.stride(0), (long)tab.stride(1),
       (long)cnt.stride(0), (long)m_part.stride(0),
-      (long)out.stride(0), (long)out.stride(1));
+      (long)out.stride(0), (long)out.stride(1), ta);
   };
   if (v_src == 0) run(amass_decode_split2<0>);
   else            run(amass_decode_split2<1>);
@@ -1148,7 +1238,8 @@ void amass_decode_split_launch(
     torch::Tensor tab, torch::Tensor cnt, torch::Tensor sl,
     torch::Tensor m_part, torch::Tensor l_part, torch::Tensor acc_part,
     double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t split,
-    int64_t pps_min, int64_t v_src) {
+    int64_t pps_min, int64_t v_src, std::vector<int64_t> tier_pack) {
+  const TierArgs ta = make_tier_args(tier_pack);
   const int d = 128;
   TORCH_CHECK(k.size(-1) == d, "amass_decode_cuda: d must be 128");
   TORCH_CHECK(k.size(1) == PAGE, "amass_decode_cuda: page must be 16");
@@ -1179,7 +1270,7 @@ void amass_decode_split_launch(
       (long)k.stride(0), (long)k.stride(1), (long)k.stride(2),
       (long)v.stride(0), (long)v.stride(1), (long)v.stride(2),
       (long)bt.stride(0), (long)tab.stride(0), (long)tab.stride(1),
-      (long)cnt.stride(0), (long)m_part.stride(0));
+      (long)cnt.stride(0), (long)m_part.stride(0), ta);
   };
   if (v_src == 0) run(amass_decode_split<0>);
   else            run(amass_decode_split<1>);
@@ -1195,6 +1286,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("merge", &amass_merge_launch, "AMASS split-K merge");
 }
 """
+
+def _tier_pack(vsource):
+    """15-int64 tier pointer pack for the ``V_SRC==1`` kernels ([] = resident).
+
+    Mirrors ``tier/decode_mem.py::mem_decode_ptrsel``'s argument derivation:
+    hot/staged/pinned int16 bases + page2slot/vbo keys + staging strides +
+    (lidx, NB, S) addressing scalars + the mem-kv K flag.  All buffers are
+    tier-owned, alloc-once, address-stable -> the baked pointers are CUDA-graph
+    safe (contents update device-side via tier.step each step)."""
+    if getattr(vsource, "SRC_ID", 0) != 1:
+        return []
+    u = vsource.union()
+    stgv = u["v_pool"].view(torch.int16)
+    k_tier = 1 if getattr(vsource, "K_SRC", 0) else 0
+    if k_tier:
+        hot_k, poolk = vsource.k_tier_ptrs()
+        kp, skb, skt, skh = vsource.k_args()
+        assert (skb, skt, skh) == (stgv.stride(0), stgv.stride(1),
+                                   stgv.stride(2)), \
+            "tiered CUDA decode assumes k_pool strides == v_pool strides"
+        hotk_ptr = hot_k.view(torch.int16).data_ptr()
+        stgk_ptr = kp.view(torch.int16).data_ptr()
+        poolk_ptr = poolk.data_ptr()
+    else:
+        hotk_ptr = stgk_ptr = poolk_ptr = 0
+    return [u["hot_i16"].data_ptr(), stgv.data_ptr(), u["pool"].data_ptr(),
+            hotk_ptr, stgk_ptr, poolk_ptr,
+            u["page2slot"].data_ptr(), u["vbo"].data_ptr(),
+            stgv.stride(0), stgv.stride(1), stgv.stride(2),
+            int(u["NB"]), int(u["S"]), int(u["lidx"]), k_tier]
+
 
 _MODS: dict = {}
 _DEFAULT_NSTAGE = int(os.environ.get("AMASS_CUDA_NSTAGE", "6"))
@@ -1302,6 +1424,7 @@ def sparse_paged_decode_batched_cuda(q: torch.Tensor, kv_cache: torch.Tensor,
 
     v_ptr, _svb, _svt, _svh = vsource.args()
     V_SRC = vsource.SRC_ID
+    tier_pack = _tier_pack(vsource)
 
     # SPLIT2 (opt-in, MEASURED SLOWER -- kept for the record): merge FOLDED into
     # the decode launch via a last-CTA reduction.  Bitwise-equal to split+merge
@@ -1320,13 +1443,13 @@ def sparse_paged_decode_batched_cuda(q: torch.Tensor, kv_cache: torch.Tensor,
         mod.decode_split2(
             q, k_view, v_ptr, block_table, st.page_table, st.page_cnt,
             seq_lens, st.m_part, st.l_part, st.acc_part, arrive, out,
-            float(scale), n_req, n_kv, G, split, pps_min, V_SRC)
+            float(scale), n_req, n_kv, G, split, pps_min, V_SRC, tier_pack)
         return
 
     mod.decode_split(
         q, k_view, v_ptr, block_table, st.page_table, st.page_cnt, seq_lens,
         st.m_part, st.l_part, st.acc_part, float(scale),
-        n_req, n_kv, G, split, pps_min, V_SRC)
+        n_req, n_kv, G, split, pps_min, V_SRC, tier_pack)
 
     # The Triton merge is the default: a hand-CUDA merge (mod.merge, opt-in via
     # AMASS_CUDA_CMERGE=1) was measured SLOWER in-pipeline (32-thread CTAs -> low
@@ -1375,4 +1498,4 @@ def sparse_paged_decode_fused_cuda(q: torch.Tensor, kv_cache: torch.Tensor,
     V_SRC = vsource.SRC_ID
     mod.decode_fused(
         q, k_view, v_ptr, block_table, st.page_table, st.page_cnt, seq_lens,
-        out, float(scale), n_req, n_kv, G, V_SRC)
+        out, float(scale), n_req, n_kv, G, V_SRC, _tier_pack(vsource))

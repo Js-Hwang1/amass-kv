@@ -53,16 +53,20 @@ class AmassConfig:
     #     resident selector 3.28x (15.6% -> ~3.4% int4-V of the KV) while beating
     #     r8 on LongBench-v1, with a cheaper tail-free hot-path kernel that runs
     #     on the hand-CUDA Hopper tensor-core kernel.
-    #   "clse" (opt-in, reasoning-optimized) = quad's storage geometry PLUS
+    #   "clse" (DEFAULT, reasoning-optimized) = quad's storage geometry PLUS
     #     rank-r' per-key coords (int4, ~18 B/page) + a residual scalar, scored
-    #     with the r'-projected logsumexp + isotropic residual.  This recovers
-    #     the peaky single-key mass the Gaussian drop-c "quad" form misses
-    #     (reasoning recall .68 -> .80; see ours_doc CLSE signal note).  For now
-    #     CLSE runs on the graph-safe Triton reference path; a hand-CUDA CLSE
-    #     kernel is a FOLLOW-UP, so the fast production default stays "quad".
+    #     with the r'-projected logsumexp + isotropic residual.  Recovers the
+    #     peaky single-key mass the Gaussian drop-c "quad" form misses (reasoning
+    #     recall .68 -> .80; matches the EXACT-LSE selector on AIME within noise).
+    #     ~3.44% resident.  Ships a hand-CUDA Hopper kernel (v0.1.1, ~1.1-1.5x the
+    #     quad score time; 3.2-8.9x over the Triton reference) with a Triton
+    #     fallback.  See ours_doc CLSE signal note.
+    #   "quad" = speed-first (drops the per-key coords c; slightly faster hot
+    #     path, but loses peaky reasoning mass).  Set score="quad" for max
+    #     throughput when reasoning-losslessness is not required.
     #   "r8" = the backward-safe fallback (per-key low-rank logsumexp page-mass
     #     estimate mu/Vk/c, rank r8_rank).
-    score: Literal["r8", "quad", "clse"] = "quad"
+    score: Literal["r8", "quad", "clse"] = "clse"
     quad_rank: int = 2             # quad rank r' (default 2; rank-insensitive)
     # quad V-summary quant bits (production default = int4).  int4-V = ~3.4%
     # resident selector (vs int8's 4.7%): a free memory reduction, RULER

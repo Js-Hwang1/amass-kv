@@ -84,6 +84,9 @@ _I8W_WARPS = int(os.environ.get("QI8W_WARPS", "4"))
 _I8W_NSTAGE = int(os.environ.get("QI8W_NSTAGE", "2"))
 _I8W_ZSPLIT = int(os.environ.get("QI8W_ZSPLIT", "0"))
 _I8W_KH = int(os.environ.get("QI8W_KH", "2"))     # kv-heads per CTA (slab width)
+_I8W_CMAXRREG = int(os.environ.get("QI8W_CLSE_MAXRREG", "0"))  # clse reg cap A/B
+_I8W_CWAVE4 = int(os.environ.get("QI8W_CLSE_WAVE4", "0"))      # clse 4+4 tail A/B
+_I8W_CSTAGE = int(os.environ.get("QI8W_CLSE_CSTAGE", "0"))     # smem-staged coords
 
 
 def _zsplit(n_req: int, n_kv: int) -> int:
@@ -744,6 +747,35 @@ static_assert(QI8W_NSTAGE == 2, "qi8w ring is a hard double buffer");
 #ifndef QI8W_V4
 #define QI8W_V4 0          // 1 = int4 V (2 signed nibbles/byte along r'=2)
 #endif
+#ifndef QI8W_CLSE
+#define QI8W_CLSE 0        // 1 = CLSE score: per-key coord LSE tail + iso-resid
+#endif
+#if QI8W_CLSE
+#ifndef QI8W_CB
+#define QI8W_CB 4          // coord bits: 4 (2 signed nibbles/byte) | 8
+#endif
+#ifndef QI8W_CTOK
+#define QI8W_CTOK 1        // 1 = token-grain c_scale (fp16/key), 0 = page-grain
+#endif
+#ifndef QI8W_CWAVE4
+#define QI8W_CWAVE4 0      // 1 = 4+4 online tail (register A/B)
+#endif
+#ifndef QI8W_CSTAGE
+#define QI8W_CSTAGE 0      // 1 = stage decoded+scaled coords in smem once per
+                           //     (pair, head): kills the 8x gid-redundant
+                           //     nibble decode + per-token cs multiply
+#endif
+#if QI8W_CB == 4
+#define CBH 16             // c-code slab bytes / kv-head (page * r'/2)
+#else
+#define CBH 32             // c-code slab bytes / kv-head (page * r')
+#endif
+#if QI8W_CTOK
+#define CSBH 32            // c_scale bytes / kv-head (page fp16)
+#else
+#define CSBH 2             // one fp16 scale / (block, kv-head)
+#endif
+#endif
 
 #define DMAX 128
 #define PAGE 16
@@ -768,10 +800,19 @@ static_assert(QI8W_NSTAGE == 2, "qi8w ring is a hard double buffer");
 // slot geometry (compile-time from QI8W_KH; VHB = V slab bytes per head):
 //   V slab   KH*VHB B @ 0        | mu slab KH*128 B @ MUOFF (+32B stagger)
 //   scales   vvs @ SCOFF, sig2 @ SCOFF+32, mus @ SCOFF+64 (32B strides)
-//   page B   @ PBLK = round128(SCOFF+96) + 64  (16-bank offset from page A)
+//   CLSE     c codes @ CLOFF (KH*CBH), c_scale @ CSOFF, resid @ RSOFF
+//   page B   @ PBLK = round128(end) + 64  (16-bank offset from page A)
 #define MUOFF (QI8W_KH * VHB + 32)
 #define SCOFF (MUOFF + QI8W_KH * 128)
+#if QI8W_CLSE
+#define CLOFF (SCOFF + 96)
+#define CSOFF (CLOFF + QI8W_KH * CBH)
+#define RSOFF (CSOFF + (((QI8W_KH * CSBH) + 15) / 16) * 16)
+#define SLOTEND (RSOFF + (((QI8W_KH * 2) + 15) / 16) * 16)
+#define PBLK  (((SLOTEND + 127) / 128) * 128 + 64)
+#else
 #define PBLK  ((((SCOFF + 96) + 127) / 128) * 128 + 64)
+#endif
 #define SLOT_BYTES (2 * PBLK)
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
@@ -810,14 +851,18 @@ qi8w_score_kernel(
     const int8_t*  __restrict__ vv,          // (NB,n_kv,d,r')
     const __half*  __restrict__ vvs,         // (NB,n_kv,r')
     const __half*  __restrict__ sig2,        // (NB,n_kv,r')
+    const int8_t*  __restrict__ cc,          // (NB,n_kv,page,rc)   [CLSE]
+    const __half*  __restrict__ cs,          // (NB,n_kv[,page])    [CLSE]
+    const __half*  __restrict__ rs,          // (NB,n_kv)           [CLSE]
     const int*     __restrict__ bt,          // (n_req, bt_stride)
     const int*     __restrict__ nsh,         // (R,)
     float*         __restrict__ score,       // (R,n_kv,MP)
     float*         __restrict__ score_h,     // (R,n_kv,G,MP)  (nrm combine)
-    const float scale, const int n_kv, const int G,
+    const float scale, const float iso_coef, const int n_kv, const int G,
     const long q_st, const long q_hs,
     const long mu_sb, const long mus_sb, const long v_sb,
     const long vs_sb, const long sg_sb,
+    const long c_sb, const long cs_sb, const long rs_sb,
     const int bt_stride,
     const long sc_sr, const long sc_sh, const int MP,
     const long sh_sr, const long sh_sh, const long sh_sg, const int write_h)
@@ -844,6 +889,14 @@ qi8w_score_kernel(
     // the mma as (nib ^ 8) in 0..15 -- signed = (nib^8) - 8 uniformly -- and
     // the -8 plane is folded out in the integer epilogue: comb -= 8*qsum.
     int*      qsum_sh = reinterpret_cast<int*>(qsc_sh + QI8W_KH * GMX);
+#endif
+#if QI8W_CLSE
+    // per-head fp32 |q|^2 (the CLSE iso-residual term needs it)
+#if QI8W_V4
+    float*    qsq_sh = reinterpret_cast<float*>(qsum_sh + QI8W_KH * GMX);
+#else
+    float*    qsq_sh = qsc_sh + QI8W_KH * GMX;
+#endif
 #endif
 
     // ---- q -> 2-limb int8 for this CTA's KH*G heads (once per CTA) --------- //
@@ -887,11 +940,23 @@ qi8w_score_kernel(
         qsl = __reduce_add_sync(~0u, qsl);     // REDUX.SYNC (1 instr, sm_80+)
         if (lane == 0) qsum_sh[h] = (h < nrows) ? qsl : 0;
 #endif
+#if QI8W_CLSE
+        float sq = v4[0] * v4[0] + v4[1] * v4[1] + v4[2] * v4[2]
+                 + v4[3] * v4[3];
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1)
+            sq += __shfl_xor_sync(~0u, sq, o);
+        if (lane == 0) qsq_sh[h] = (h < nrows) ? sq : 0.f;
+#endif
     }
     __syncthreads();
 
     const float qcoef = scale * scale / (2.f * (float)PAGE);
     const int half = t4 >> 1;                  // this lane's page-half of C
+#if QI8W_CLSE && QI8W_CSTAGE
+    // decoded+scaled coords, one (pair, head) at a time: [page][token][col]
+    __shared__ float cstg_sh[QI8W_WARPS][2][PAGE][2];
+#endif
 
     // ---- per-warp double-buffered ring of page-PAIR slabs ------------------ //
     int8_t* wring = ring + (long)warp * QI8W_NSTAGE * SLOT_BYTES;
@@ -921,6 +986,26 @@ qi8w_score_kernel(
         else if (lane < 2 * QI8W_KH + QI8W_KH / 2)
             cp_async4(dst + SCOFF + 64 + (lane - 2 * QI8W_KH) * 4,
                       sm + (lane - 2 * QI8W_KH) * 4);
+#if QI8W_CLSE
+        // CLSE slabs: c codes (KH*CBH B), c_scale (KH*CSBH B), resid (KH*2 B)
+        const int8_t* cg = cc + (long)blk * c_sb + (long)kh0 * CBH;
+        #pragma unroll
+        for (int i = lane; i < QI8W_KH * (CBH / 16); i += 32)
+            cp_async16(dst + CLOFF + i * 16, cg + i * 16);
+#if QI8W_CTOK
+        const int8_t* csg = (const int8_t*)cs + ((long)blk * cs_sb + kh0 * PAGE) * 2;
+        #pragma unroll
+        for (int i = lane; i < QI8W_KH * (CSBH / 16); i += 32)
+            cp_async16(dst + CSOFF + i * 16, csg + i * 16);
+#else
+        const int8_t* csg = (const int8_t*)cs + ((long)blk * cs_sb + kh0) * 2;
+        if (lane >= 24 && lane < 24 + QI8W_KH / 2)
+            cp_async4(dst + CSOFF + (lane - 24) * 4, csg + (lane - 24) * 4);
+#endif
+        const int8_t* rg = (const int8_t*)rs + ((long)blk * rs_sb + kh0) * 2;
+        if (lane >= 28 && lane < 28 + QI8W_KH / 2)
+            cp_async4(dst + RSOFF + (lane - 28) * 4, rg + (lane - 28) * 4);
+#endif
     };
     auto load_pair = [&](int pp, int slot) {
         int8_t* sl8 = wring + (long)slot * SLOT_BYTES;
@@ -1017,11 +1102,219 @@ qi8w_score_kernel(
             const int comb1 = 128 * acc[1] + acc[3];
             const __half2 vvs2 = *reinterpret_cast<const __half2*>(
                 pb8 + SCOFF + kh * RP * 2);
-            const __half2 sg2  = *reinterpret_cast<const __half2*>(
-                pb8 + SCOFF + 32 + kh * RP * 2);
             float S = -CUDART_INF_F;
             float qmu_own = (float)comb0 * qs * musf * scale;
             float qmu = __shfl_sync(~0u, qmu_own, lane | 1);
+#if QI8W_CLSE
+            // ---- CLSE tail: S = qmu + logsumexp_t[(qh.c_t) s] + iso ------ //
+            // qh0/qh1 (dequantized r'=2 projections) live on the EVEN t4
+            // lanes (V-column combs); broadcast to the odd pair lane, then
+            // the 16-token LSE is SPLIT across the (even, odd) pair (8 tokens
+            // each) and merged with one shuffle -- halves the tail chain and
+            // puts the otherwise-idle mu-column lanes to work.
+            {
+                const float2 vs = __half22float2(vvs2);
+#if QI8W_V4
+                const int cq8 = 8 * qsum_sh[kh * G + ((gid < G) ? gid : 0)];
+                float qh0 = (float)(comb0 - cq8) * qs * vs.x;
+                float qh1 = (float)(comb1 - cq8) * qs * vs.y;
+#else
+                float qh0 = (float)comb0 * qs * vs.x;
+                float qh1 = (float)comb1 * qs * vs.y;
+#endif
+                qh0 = __shfl_sync(~0u, qh0, lane & ~1);
+                qh1 = __shfl_sync(~0u, qh1, lane & ~1);
+                const int tbase = (t4 & 1) * 8;        // even: 0-7, odd: 8-15
+#if QI8W_CSTAGE
+                // ---- cooperative coord decode: the c bytes are per (page,
+                // head) -- SHARED across the 8 gid lanes -- so decode+scale
+                // them ONCE per (pair, head) (lane l -> page l>>4, token
+                // l&15, both cols) into a tiny smem plane instead of 8x
+                // redundantly per lane (the cvt lesson).  Association matches
+                // Triton (c*cs first).
+                __syncwarp();
+                {
+                    const int sp2 = lane >> 4;         // staged page half
+                    const int stk = lane & 15;         // staged token
+                    const int8_t* sb = sl8 + (sp2 ? PBLK : 0);
+#if QI8W_CTOK
+                    const float scs = __half2float(reinterpret_cast<const __half*>(
+                        sb + CSOFF + kh * CSBH)[stk]);
+#else
+                    const float scs = __half2float(reinterpret_cast<const __half*>(
+                        sb + CSOFF)[kh]);
+#endif
+#if QI8W_CB == 4
+                    const unsigned byt = ((unsigned)(unsigned char)
+                        (sb + CLOFF + kh * CBH)[stk]) ^ 0x88u;
+                    const float f0 = (__uint_as_float(0x4B000000u | (byt & 0xFu))
+                                      - (8388608.f + 8.f)) * scs;
+                    const float f1 = (__uint_as_float(0x4B000000u | (byt >> 4))
+                                      - (8388608.f + 8.f)) * scs;
+#else
+                    const int8_t* cb2 = sb + CLOFF + kh * CBH + stk * 2;
+                    const unsigned b0 = ((unsigned)(unsigned char)cb2[0]) ^ 0x80u;
+                    const unsigned b1 = ((unsigned)(unsigned char)cb2[1]) ^ 0x80u;
+                    const float f0 = (__uint_as_float(0x4B000000u | b0)
+                                      - (8388608.f + 128.f)) * scs;
+                    const float f1 = (__uint_as_float(0x4B000000u | b1)
+                                      - (8388608.f + 128.f)) * scs;
+#endif
+                    cstg_sh[warp][sp2][stk][0] = f0;
+                    cstg_sh[warp][sp2][stk][1] = f1;
+                }
+                __syncwarp();
+                const float A = qh0 * scale, B2 = qh1 * scale;
+                float tok[8];
+                {
+                    const float2* cv2 = reinterpret_cast<const float2*>(
+                        &cstg_sh[warp][half][0][0]) + tbase;
+                    #pragma unroll
+                    for (int t = 0; t < 8; ++t) {
+                        const float2 cv = cv2[t];
+                        tok[t] = A * cv.x + B2 * cv.y;
+                    }
+                }
+                float m0 = tok[0];
+                #pragma unroll
+                for (int t = 1; t < 8; ++t) m0 = fmaxf(m0, tok[t]);
+                float s0 = 0.f;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) s0 += __expf(tok[t] - m0);
+#else
+#if QI8W_CTOK
+                const float A = qh0 * scale, B2 = qh1 * scale;
+                const __half* csp = reinterpret_cast<const __half*>(
+                    pb8 + CSOFF + kh * CSBH);
+#else
+                const float csf = __half2float(reinterpret_cast<const __half*>(
+                    pb8 + CSOFF)[kh]);
+                const float A = qh0 * scale * csf, B2 = qh1 * scale * csf;
+#endif
+#if QI8W_CWAVE4
+                // 4+4 register-lean tail: two waves of 4 tokens, online merge
+                // (saves the tok[8] live range; +2 MUFU for the wave fold).
+                float m0 = -CUDART_INF_F, s0 = 0.f;
+                #pragma unroll
+                for (int w2 = 0; w2 < 2; ++w2) {
+                    float tk[4];
+#if QI8W_CB == 4
+                    const unsigned* cw = reinterpret_cast<const unsigned*>(
+                        pb8 + CLOFF + kh * CBH + tbase);
+                    const unsigned wv = cw[w2] ^ 0x88888888u;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const unsigned byt = (wv >> (8 * j)) & 0xFFu;
+                        const float f0 = __uint_as_float(0x4B000000u | (byt & 0xFu))
+                                         - (8388608.f + 8.f);
+                        const float f1 = __uint_as_float(0x4B000000u | (byt >> 4))
+                                         - (8388608.f + 8.f);
+                        tk[j] = A * f0 + B2 * f1;
+                    }
+#else
+                    const unsigned* cw = reinterpret_cast<const unsigned*>(
+                        pb8 + CLOFF + kh * CBH + tbase * 2);
+                    #pragma unroll
+                    for (int w = 0; w < 2; ++w) {
+                        const unsigned wv = cw[w2 * 2 + w];
+                        const float c00 = __uint_as_float(
+                            0x4B000000u | ((wv & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                        const float c01 = __uint_as_float(
+                            0x4B000000u | (((wv >> 8) & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                        const float c10 = __uint_as_float(
+                            0x4B000000u | (((wv >> 16) & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                        const float c11 = __uint_as_float(
+                            0x4B000000u | ((wv >> 24) ^ 0x80u)) - (8388608.f + 128.f);
+                        tk[w * 2]     = A * c00 + B2 * c01;
+                        tk[w * 2 + 1] = A * c10 + B2 * c11;
+                    }
+#endif
+#if QI8W_CTOK
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        tk[j] *= __half2float(csp[tbase + w2 * 4 + j]);
+#endif
+                    const float mw = fmaxf(fmaxf(tk[0], tk[1]),
+                                           fmaxf(tk[2], tk[3]));
+                    const float sw = __expf(tk[0] - mw) + __expf(tk[1] - mw)
+                                   + __expf(tk[2] - mw) + __expf(tk[3] - mw);
+                    if (w2 == 0) { m0 = mw; s0 = sw; }
+                    else {
+                        const float mn = fmaxf(m0, mw);
+                        s0 = s0 * __expf(m0 - mn) + sw * __expf(mw - mn);
+                        m0 = mn;
+                    }
+                }
+#else
+                float tok[8];
+#if QI8W_CB == 4
+                // magic-fp nibble decode: two's-complement nibble n ->
+                // as_float(0x4B000000 | (n ^ 8)) - (2^23 + 8) == signed(n)
+                // EXACTLY ((n^8)-8 is the sign fold), no I2F pipe.
+                const unsigned* cw = reinterpret_cast<const unsigned*>(
+                    pb8 + CLOFF + kh * CBH + tbase);
+                #pragma unroll
+                for (int w = 0; w < 2; ++w) {
+                    const unsigned wv = cw[w] ^ 0x88888888u;   // fold both nibbles
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const unsigned byt = (wv >> (8 * j)) & 0xFFu;
+                        const float f0 = __uint_as_float(0x4B000000u | (byt & 0xFu))
+                                         - (8388608.f + 8.f);
+                        const float f1 = __uint_as_float(0x4B000000u | (byt >> 4))
+                                         - (8388608.f + 8.f);
+                        tok[w * 4 + j] = A * f0 + B2 * f1;
+                    }
+                }
+#else
+                // int8 coords: (c0,c1) byte pair / token; signed via ^0x80 fold
+                const unsigned* cw = reinterpret_cast<const unsigned*>(
+                    pb8 + CLOFF + kh * CBH + tbase * 2);
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const unsigned wv = cw[w];
+                    const float c00 = __uint_as_float(
+                        0x4B000000u | ((wv & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                    const float c01 = __uint_as_float(
+                        0x4B000000u | (((wv >> 8) & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                    const float c10 = __uint_as_float(
+                        0x4B000000u | (((wv >> 16) & 0xFFu) ^ 0x80u)) - (8388608.f + 128.f);
+                    const float c11 = __uint_as_float(
+                        0x4B000000u | ((wv >> 24) ^ 0x80u)) - (8388608.f + 128.f);
+                    tok[w * 2]     = A * c00 + B2 * c01;
+                    tok[w * 2 + 1] = A * c10 + B2 * c11;
+                }
+#endif
+#if QI8W_CTOK
+                #pragma unroll
+                for (int t = 0; t < 8; ++t)
+                    tok[t] *= __half2float(csp[tbase + t]);
+#endif
+                float m0 = tok[0];
+                #pragma unroll
+                for (int t = 1; t < 8; ++t) m0 = fmaxf(m0, tok[t]);
+                float s0 = 0.f;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) s0 += __expf(tok[t] - m0);
+#endif
+#endif  // QI8W_CSTAGE
+                const float m1 = __shfl_xor_sync(~0u, m0, 1);
+                const float s1 = __shfl_xor_sync(~0u, s0, 1);
+                const float mm = fmaxf(m0, m1);
+                const float ss = s0 * __expf(m0 - mm) + s1 * __expf(m1 - mm);
+                if ((t4 & 1) == 0 && pvalid && gid < G) {
+                    const float lse = mm + __logf(ss);
+                    const float rsf = __half2float(
+                        reinterpret_cast<const __half*>(pb8 + RSOFF)[kh]);
+                    const float iso = fmaxf(
+                        qsq_sh[kh * G + gid] - (qh0 * qh0 + qh1 * qh1), 0.f)
+                        * rsf * iso_coef;
+                    S = qmu + lse + iso;
+                }
+            }
+#else
+            const __half2 sg2  = *reinterpret_cast<const __half2*>(
+                pb8 + SCOFF + 32 + kh * RP * 2);
             if ((t4 & 1) == 0 && pvalid && gid < G) {
                 const float2 vs = __half22float2(vvs2);
                 const float2 sg = __half22float2(sg2);
@@ -1040,6 +1333,7 @@ qi8w_score_kernel(
 #endif
                 S = qmu + qcoef * (sg.x * qh0 * qh0 + sg.y * qh1 * qh1);
             }
+#endif
             if (write_h) {
                 // nrm combine: t4==0 lane owns S[gid,p0], t4==2 owns S[gid,p1].
                 if (t4 == 0 && gid < G)
@@ -1069,10 +1363,11 @@ qi8w_score_kernel(
 void qi8w_score_launch(
     torch::Tensor q, torch::Tensor mu, torch::Tensor mus,
     torch::Tensor vv, torch::Tensor vvs, torch::Tensor sig2,
+    torch::Tensor cc, torch::Tensor cs, torch::Tensor rs,
     torch::Tensor bt, torch::Tensor nsh, torch::Tensor score,
     torch::Tensor score_h,
-    double scale, int64_t n_req, int64_t n_kv, int64_t G, int64_t MP,
-    int64_t zsplit, int64_t write_h)
+    double scale, double iso_coef, int64_t n_req, int64_t n_kv, int64_t G,
+    int64_t MP, int64_t zsplit, int64_t write_h)
 {
     TORCH_CHECK(n_kv % QI8W_KH == 0, "qi8w: n_kv must be a multiple of KH");
     TORCH_CHECK(G <= 8, "qi8w: G must be <= 8");
@@ -1080,6 +1375,9 @@ void qi8w_score_launch(
     size_t qcodes = (size_t)QI8W_KH * GMX * QROW * 2 * 4 + QI8W_KH * GMX * 4;
 #if QI8W_V4
     qcodes += (size_t)QI8W_KH * GMX * 4;       // per-head qsum plane
+#endif
+#if QI8W_CLSE
+    qcodes += (size_t)QI8W_KH * GMX * 4;       // per-head |q|^2 plane
 #endif
     size_t smem = (size_t)QI8W_WARPS * QI8W_NSTAGE * SLOT_BYTES + qcodes;
     dim3 grid((unsigned)n_req, (unsigned)(n_kv / QI8W_KH), (unsigned)zsplit);
@@ -1099,13 +1397,17 @@ void qi8w_score_launch(
         vv.data_ptr<int8_t>(),
         reinterpret_cast<const __half*>(vvs.data_ptr()),
         reinterpret_cast<const __half*>(sig2.data_ptr()),
+        cc.data_ptr<int8_t>(),
+        reinterpret_cast<const __half*>(cs.data_ptr()),
+        reinterpret_cast<const __half*>(rs.data_ptr()),
         bt.data_ptr<int>(), nsh.data_ptr<int>(),
         score.data_ptr<float>(),
         score_h.data_ptr<float>(),
-        (float)scale, (int)n_kv, (int)G,
+        (float)scale, (float)iso_coef, (int)n_kv, (int)G,
         (long)q.stride(0), (long)q.stride(1),
         (long)mu.stride(0), (long)mus.stride(0), (long)vv.stride(0),
         (long)vvs.stride(0), (long)sig2.stride(0),
+        (long)cc.stride(0), (long)cs.stride(0), (long)rs.stride(0),
         (int)bt.stride(0),
         (long)score.stride(0), (long)score.stride(1), (int)MP,
         (long)score_h.stride(0), (long)score_h.stride(1),
@@ -1115,6 +1417,138 @@ void qi8w_score_launch(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qi8w_score_launch", &qi8w_score_launch,
           "AMASS quad page score, int8 tensor core, warp-owned slab streams");
+}
+"""
+
+
+# =========================================================================== #
+# Fused CUDA nrm-combine: ONE kernel replaces the two Triton passes            #
+# (per-head page-max, then score[p] = sum_g exp(S[g,p] - hmax[g])).            #
+#                                                                              #
+# WHY (final-opt profile): the Triton passes read score_h TWICE from DRAM and  #
+# monolithically tile P_PAD = next_pow2(MP) (a (G, 8192) fp32 block per        #
+# program at 64K ctx) -> 55-57us at bs16/64K vs a ~19us byte floor, plus two   #
+# extra launches on the bs1 latency path.  Here one CTA owns a (req, kv-head)  #
+# row: phase 1 sweeps S[g, 0:nsh) for the per-g max (bringing the row into     #
+# L2: G*MP*4 = 131KB/row), phase 2 re-reads it L2-hot for the exp-sum.  Same   #
+# math, deterministic (fixed reduction order), no hmax global buffer, no       #
+# alloc, fixed shapes -> graph-safe.  PDL: waits on the score kernel's drain   #
+# and releases the dependent topb (the score->nrm->topb->decode chain).        #
+# =========================================================================== #
+_CUDA_SRC_NRM = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define GMX 8
+
+__global__ __launch_bounds__(1024) void
+nrm_combine_kernel(
+    const float* __restrict__ score_h,   // (R, n_kv, G, MP)
+    const int*   __restrict__ nsh,       // (R,)
+    float*       __restrict__ score,     // (R, n_kv, MP)
+    const int G,
+    const long sh_sr, const long sh_sh, const long sh_sg,
+    const long sc_sr, const long sc_sh)
+{
+    const int req = blockIdx.x;
+    const int kh  = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int BLK = blockDim.x;
+    const int lane = tid & 31;
+    const int wid  = tid >> 5;
+    const int nwarp = BLK >> 5;
+
+    __shared__ float wmax[32][GMX];      // per-warp per-g maxima
+    __shared__ float hmax_sh[GMX];
+
+    // PDL: start while the score grid drains; fence before reading score_h.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+
+    const int n = nsh[req];
+    const float* shp = score_h + (long)req * sh_sr + (long)kh * sh_sh;
+
+    // ---- phase 1: per-g max over the selectable region ------------------- //
+    float lmax[GMX];
+    #pragma unroll
+    for (int g = 0; g < GMX; ++g) lmax[g] = -CUDART_INF_F;
+    for (int p = tid; p < n; p += BLK) {
+        #pragma unroll
+        for (int g = 0; g < GMX; ++g)
+            if (g < G)
+                lmax[g] = fmaxf(lmax[g], shp[(long)g * sh_sg + p]);
+    }
+    #pragma unroll
+    for (int g = 0; g < GMX; ++g) {
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1)
+            lmax[g] = fmaxf(lmax[g], __shfl_xor_sync(~0u, lmax[g], o));
+        if (lane == 0) wmax[wid][g] = lmax[g];
+    }
+    __syncthreads();
+    if (wid == 0 && lane < GMX) {
+        float m = -CUDART_INF_F;
+        for (int w = 0; w < nwarp; ++w) m = fmaxf(m, wmax[w][lane]);
+        hmax_sh[lane] = m;
+    }
+    __syncthreads();
+
+    // ---- phase 2: score[p] = sum_g exp(S[g,p] - hmax[g])  (L2-hot reread) - //
+    float hm[GMX];
+    #pragma unroll
+    for (int g = 0; g < GMX; ++g) hm[g] = hmax_sh[g];
+    float* scp = score + (long)req * sc_sr + (long)kh * sc_sh;
+    for (int p = tid; p < n; p += BLK) {
+        float acc = 0.f;
+        #pragma unroll
+        for (int g = 0; g < GMX; ++g)
+            if (g < G)
+                acc += __expf(shp[(long)g * sh_sg + p] - hm[g]);
+        scp[p] = acc;
+    }
+    // release the dependent (topb) as this grid drains
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+void nrm_combine_launch(torch::Tensor score_h, torch::Tensor nsh,
+                        torch::Tensor score, int64_t n_req, int64_t n_kv,
+                        int64_t G, int64_t blk, int64_t pdl)
+{
+    TORCH_CHECK(G <= GMX, "nrm_combine: G must be <= 8");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid((unsigned)n_req, (unsigned)n_kv);
+    dim3 block((unsigned)blk);
+    if (pdl) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid;
+        cfg.blockDim = block;
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, nrm_combine_kernel,
+            score_h.data_ptr<float>(), nsh.data_ptr<int>(),
+            score.data_ptr<float>(), (int)G,
+            (long)score_h.stride(0), (long)score_h.stride(1),
+            (long)score_h.stride(2),
+            (long)score.stride(0), (long)score.stride(1));
+        return;
+    }
+    nrm_combine_kernel<<<grid, block, 0, stream>>>(
+        score_h.data_ptr<float>(), nsh.data_ptr<int>(),
+        score.data_ptr<float>(), (int)G,
+        (long)score_h.stride(0), (long)score_h.stride(1),
+        (long)score_h.stride(2),
+        (long)score.stride(0), (long)score.stride(1));
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("nrm_combine_launch", &nrm_combine_launch,
+          "AMASS fused nrm GQA-combine (Hopper)");
 }
 """
 
@@ -1164,13 +1598,17 @@ def _zsplit_i8w(n_req: int, n_kv: int, max_pages: int, kh: int = None) -> int:
     return max(4, min(256, z))
 
 
-def _get_i8w(kh: int = None, v_bits: int = 8):
+def _get_i8w(kh: int = None, v_bits: int = 8, clse: bool = False,
+             c_bits: int = 4, c_grain: str = "token"):
     """Build (once, hash-cached) the warp-owned-slab int8 tensor-core kernel.
     ``v_bits=4`` compiles the QI8W_V4 variant (packed-nibble V, unpacked into
-    the SAME int8 mma B fragment in-kernel; mu stays int8)."""
+    the SAME int8 mma B fragment in-kernel; mu stays int8).  ``clse=True``
+    compiles the QI8W_CLSE variant (per-key coord logsumexp tail + iso-resid;
+    ``c_bits``/``c_grain`` select the coord quant/scale-grain sub-variants)."""
     if kh is None:
         kh = _I8W_KH
-    key = ("i8w", _I8W_WARPS, _I8W_NSTAGE, kh, int(v_bits))
+    key = ("i8w", _I8W_WARPS, _I8W_NSTAGE, kh, int(v_bits),
+           bool(clse), int(c_bits), c_grain)
     if key in _MODS:
         return _MODS[key]
     from torch.utils.cpp_extension import load_inline
@@ -1182,6 +1620,19 @@ def _get_i8w(kh: int = None, v_bits: int = 8):
     if v_bits == 4:
         flags.append("-DQI8W_V4=1")
         suffix += "v4"
+    if clse:
+        flags += ["-DQI8W_CLSE=1", f"-DQI8W_CB={int(c_bits)}",
+                  f"-DQI8W_CTOK={1 if c_grain == 'token' else 0}"]
+        suffix += f"_clse{int(c_bits)}{'t' if c_grain == 'token' else 'p'}"
+        if _I8W_CWAVE4:
+            flags.append("-DQI8W_CWAVE4=1")
+            suffix += "w4"
+        if _I8W_CSTAGE:
+            flags.append("-DQI8W_CSTAGE=1")
+            suffix += "cs"
+        if _I8W_CMAXRREG > 0:
+            flags.append(f"-Xptxas=-maxrregcount={_I8W_CMAXRREG}")
+            suffix += f"r{_I8W_CMAXRREG}"
     _verbose = os.environ.get("QUAD_PTXAS_V", "0") != "0"
     if _verbose:
         flags.append("-Xptxas=-v")
@@ -1217,11 +1668,45 @@ def _get_i8(v_bits: int = 8):
     return mod
 
 
+_NRM_CUDA = None   # latch: None untried, module when built, False = fallback
+
+
+def _get_nrm():
+    global _NRM_CUDA
+    if _NRM_CUDA is None:
+        from torch.utils.cpp_extension import load_inline
+        _NRM_CUDA = load_inline(
+            name="amass_nrm_combine_cuda",
+            cpp_sources="", cuda_sources=_CUDA_SRC_NRM,
+            extra_cuda_cflags=["-O3", "--use_fast_math",
+                               "-gencode=arch=compute_90a,code=sm_90a"],
+            verbose=False)
+    return _NRM_CUDA
+
+
 def _nrm_from_cuda(st, n_req: int) -> None:
-    """Reduce the per-head scores the CUDA kernel wrote into ``st.score_h`` into
-    ``st.score`` via the shared Triton nrm passes (per-head page-max, then
-    sum_g exp(S[g] - hmax[g])).  Same math as the Triton quad reference's nrm
-    combine, so CUDA vs Triton stay bitwise-matched at the selection level."""
+    """Reduce the per-head scores the CUDA score kernel wrote into
+    ``st.score_h`` into ``st.score``.  Runs the FUSED single-kernel CUDA
+    combine (phase-1 per-head max brings the row into L2, phase-2 exp-sum
+    re-reads it hot; PDL edges to the score kernel and topb) and latches to
+    the Triton two-pass reference if the build fails."""
+    global _NRM_CUDA
+    if _NRM_CUDA is not False:
+        try:
+            mod = _get_nrm()
+            # BLK=1024 measured best at every cell (bs1/16K 5.7->5.2us,
+            # bs16/16K 6.1->5.7, 64K unchanged): more parallel loads shorten
+            # the phase-1 latency chains; 128/256 leave them exposed.
+            blk = int(os.environ.get("AMASS_NRM_BLK", "1024"))
+            pdl = int(os.environ.get("AMASS_PDL", "1"))
+            mod.nrm_combine_launch(st.score_h, st.n_sel_hi, st.score,
+                                   int(n_req), int(st.n_kv), int(st.G),
+                                   blk, pdl)
+            return
+        except Exception as e:  # noqa: BLE001
+            _NRM_CUDA = False
+            print(f"[amass] CUDA nrm combine unavailable "
+                  f"({type(e).__name__}: {e}) -> Triton passes", flush=True)
     from .quad_score import _nrm_launch
     _nrm_launch(st, n_req)
 
@@ -1276,8 +1761,9 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
             mod = _get_i8w(v_bits=v_bits)
             mod.qi8w_score_launch(
                 q, mu, mu_s, V, V_s, sig2,
+                mu, mu_s, mu_s,          # cc/cs/rs unused in quad builds
                 block_table, st.n_sel_hi, st.score, score_h,
-                float(scale), int(n_req), n_kv, G,
+                float(scale), 0.0, int(n_req), n_kv, G,
                 int(st.max_pages),
                 int(_zsplit_i8w(int(n_req), n_kv, int(st.max_pages))),
                 int(write_h))
@@ -1304,5 +1790,53 @@ def quad_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
         block_table, st.n_sel_hi, st.score, score_h,
         float(scale), int(n_req), int(st.n_kv), int(st.G), int(st.max_pages),
         int(_zsplit(int(n_req), int(st.n_kv))), int(write_h))
+    if nrm:
+        _nrm_from_cuda(st, int(n_req))
+
+
+def clse_score_cuda(st, layer: int, q, block_table, seq_lens, n_req: int,
+                    scale: float) -> None:
+    """CUDA drop-in for the Triton ``clse_score`` (same contract): writes
+    ``st.score`` (R, n_kv, MP) fp32 over the selectable region, with the
+    state's GQA combine (max in-kernel | nrm via the shared Triton passes).
+
+    Runs the QI8W_CLSE compile variant of the warp-owned-slab tensor-core
+    kernel: the quad mma front end (2-limb int8 q; B cols [V0 V1 mu 0]) plus a
+    per-key coord logsumexp tail (the 16 tokens split across the (even, odd)
+    lane pair, magic-constant nibble->fp decode) and the iso-residual term.
+    Covers r'=2, int8/int4 V, int8/int4 coords, token/page-grain coord scales,
+    n_kv %% KH == 0, G <= 8 -- the production CLSE configs.  Anything else
+    must stay on the Triton reference (the caller latches the fallback).
+    """
+    mu, mu_s, V, V_s, sig2 = _quad_layer_state(st, layer)
+    c, c_s, resid = st.quad_c[layer], st.c_scale[layer], st.quad_resid[layer]
+    rp = int(getattr(st, "rp", None) or getattr(st, "r", 2))
+    n_kv, G = int(st.n_kv), int(st.G)
+    page, d = int(st.page), int(st.d)
+    v_bits = 8 if V.shape[-1] == rp else 4
+    c_bits = int(getattr(st, "c_bits", 4))
+    c_grain = getattr(st, "c_grain", "token")
+    vhb = 128 * rp if v_bits == 8 else 64 * rp
+    cbh = page * rp if c_bits == 8 else page * rp // 2
+    cs_hs = page if c_grain == "token" else 1
+    if not (rp == 2 and page == 16 and n_kv % _I8W_KH == 0 and G <= 8
+            and V.stride(1) == vhb and mu.stride(1) == 128
+            and c.stride(1) == cbh and c_s.stride(1) == cs_hs
+            and resid.stride(1) == 1):
+        raise RuntimeError(
+            f"clse_score_cuda: unsupported geometry (r'={rp} page={page} "
+            f"n_kv={n_kv} G={G}) -- use the Triton clse_score")
+    nrm = getattr(st, "combine", "max") == "nrm"
+    score_h = st.score_h if nrm else st.score
+    write_h = 1 if nrm else 0
+    iso_coef = float(scale) * float(scale) / (2.0 * page * max(d - rp, 1))
+    mod = _get_i8w(v_bits=v_bits, clse=True, c_bits=c_bits, c_grain=c_grain)
+    mod.qi8w_score_launch(
+        q, mu, mu_s, V, V_s, sig2, c, c_s, resid,
+        block_table, st.n_sel_hi, st.score, score_h,
+        float(scale), iso_coef, int(n_req), n_kv, G,
+        int(st.max_pages),
+        int(_zsplit_i8w(int(n_req), n_kv, int(st.max_pages))),
+        int(write_h))
     if nrm:
         _nrm_from_cuda(st, int(n_req))

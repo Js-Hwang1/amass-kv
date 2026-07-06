@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amass-kv"
-version = "0.1.0"
+version = "0.1.1"
 description = "AMASS: decode-time sparse KV-cache attention for vLLM (quad page-score selector + DRAM value tier)"
 readme = "README.md"
 requires-python = ">=3.10"
